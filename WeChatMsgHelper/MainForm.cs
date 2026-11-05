@@ -13,11 +13,16 @@ namespace WeChatMsgHelper
     internal sealed class MainForm : Form
     {
         private const int WmHotkey = 0x0312;
+        private const int DiscoveryFastIntervalMs = 500;
+        private const int DiscoveryStableIntervalMs = 1000;
+        private const int DiscoveryIdleIntervalMs = 2000;
+        private const int VoipProbeIntervalMs = 1000;
         private readonly Discovery discovery = new Discovery();
         private readonly MessageSoundPlayer messageSounds = new MessageSoundPlayer();
         private readonly WeChatNavigator navigator = new WeChatNavigator();
         private readonly System.Windows.Forms.Timer discoveryTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer contextTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer voipTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer hotkeyFallbackTimer = new System.Windows.Forms.Timer();
         private AppConfig config;
         private MessageExtractor extractor;
@@ -32,7 +37,9 @@ namespace WeChatMsgHelper
         private string statusText = "正在启动...";
         private bool exiting;
         private bool settingsOpen;
+        private bool wechatWasForeground;
         private int discoveryPending;
+        private int voipProbePending;
         private bool updateCheckPending;
 
         public MainForm()
@@ -54,24 +61,28 @@ namespace WeChatMsgHelper
             config = LoadConfig();
             MigrateLegacyHotkeys();
             tray = new TrayIcon(ToggleListening, SetMode, SetSpeechChannel, ReadLatest, TestSpeech, OpenSettings,
-                delegate { CheckForUpdates(true); }, ShowCurrentReleaseNotes, ExitApplication);
+                delegate { CheckForUpdates(true); }, ShowCurrentReleaseNotes, ExportLog, ExitApplication);
             hotkeys = new HotkeyManager(Handle);
             hotkeys.RegisterAll(config, ReportHotkeyFailure);
             CreateListener();
             RebuildSpeech(false);
-            searchAnnouncer = new SearchResultAnnouncer(Dispatch, SpeakText);
+            searchAnnouncer = new SearchResultAnnouncer(Dispatch, SpeakText,
+                delegate(string name) { if (listener != null) listener.NoteEmojiSent(name); });
             ApplySavedStartup();
 
-            discoveryTimer.Interval = 500;
+            discoveryTimer.Interval = DiscoveryFastIntervalMs;
             discoveryTimer.Tick += delegate { BeginBindWechat(); };
             discoveryTimer.Start();
             contextTimer.Interval = 250;
             contextTimer.Tick += delegate { SafeUpdateContextHotkeys(); };
             contextTimer.Start();
+            voipTimer.Interval = VoipProbeIntervalMs;
+            voipTimer.Tick += delegate { BeginUpdateVoipContext(); };
+            voipTimer.Start();
             hotkeyFallbackTimer.Interval = 40;
             hotkeyFallbackTimer.Tick += delegate { PollHotkeyFallback(); };
-            hotkeyFallbackTimer.Start();
             BeginBindWechat();
+            BeginUpdateVoipContext();
             UpdateTray();
             WarnAboutNvda();
             BeginInvoke(new Action(delegate
@@ -99,6 +110,7 @@ namespace WeChatMsgHelper
             if (!exiting) exiting = true;
             discoveryTimer.Stop();
             contextTimer.Stop();
+            voipTimer.Stop();
             hotkeyFallbackTimer.Stop();
             // Speak before UIA and worker cleanup so the exit announcement is immediate.
             if (speechQueue != null) speechQueue.ShutdownWithAnnouncement();
@@ -110,6 +122,7 @@ namespace WeChatMsgHelper
             if (tray != null) tray.Dispose();
             discoveryTimer.Dispose();
             contextTimer.Dispose();
+            voipTimer.Dispose();
             hotkeyFallbackTimer.Dispose();
             base.OnFormClosing(e);
         }
@@ -119,6 +132,7 @@ namespace WeChatMsgHelper
             base.OnFormClosed(e);
             // A hidden tray host can leave the WinForms message loop alive on some
             // Win10/Win11 builds. Force the process to terminate after cleanup.
+            AppLog.DeleteCurrent();
             Environment.Exit(0);
         }
 
@@ -166,23 +180,27 @@ namespace WeChatMsgHelper
             if (listener != null) listener.Dispose();
             if (reviewManager != null) reviewManager.Dispose();
             extractor = new MessageExtractor(config.ReadNonTextMessages);
-            listener = new MessageListener(extractor, config, ProcessIncomingMessage, ProcessConversationOpened, Dispatch);
+            listener = new MessageListener(extractor, config, ProcessIncomingMessage, ProcessConversationOpened, Dispatch, BeginBindWechat);
             reviewManager = new MessageReviewManager(navigator, extractor, SpeakText, SuppressAutomaticNotifications);
         }
 
         private void BeginBindWechat()
         {
             if (exiting || settingsOpen || Interlocked.Exchange(ref discoveryPending, 1) != 0) return;
-            Thread worker = new Thread(new ThreadStart(delegate
+            if (!ThreadPool.QueueUserWorkItem(delegate
             {
                 IList<DiscoveredWechatRoot> roots = null;
                 Exception error = null;
+                Stopwatch stopwatch = Stopwatch.StartNew();
                 try { roots = discovery.FindWechatRoots(); }
                 catch (Exception ex) { error = ex; }
+                stopwatch.Stop();
                 Dispatch(delegate
                 {
                     Interlocked.Exchange(ref discoveryPending, 0);
                     if (exiting || settingsOpen) return;
+                    if (stopwatch.ElapsedMilliseconds >= 1000)
+                        AppLog.Write("微信 UIA 发现耗时=" + stopwatch.ElapsedMilliseconds + "ms，窗口=" + (roots == null ? 0 : roots.Count));
                     if (error != null)
                     {
                         statusText = "微信 UIA 暂时无响应";
@@ -192,17 +210,16 @@ namespace WeChatMsgHelper
                     }
                     ApplyWechatRoots(roots ?? new List<DiscoveredWechatRoot>());
                 });
-            }));
-            worker.IsBackground = true;
-            worker.Name = "WeChatMsgHelper UIA Discovery";
-            worker.SetApartmentState(ApartmentState.MTA);
-            worker.Start();
+            })) Interlocked.Exchange(ref discoveryPending, 0);
         }
 
         private void ApplyWechatRoots(IList<DiscoveredWechatRoot> roots)
         {
             if (roots.Count == 0)
             {
+                discoveryTimer.Interval = navigator.IsWechatForeground()
+                    ? DiscoveryFastIntervalMs
+                    : DiscoveryIdleIntervalMs;
                 try { listener.Synchronize(roots, true); }
                 catch (Exception ex) { AppLog.Write("清理微信 UIA 绑定失败：" + ex.Message); }
                 statusText = "等待打开具体微信聊天";
@@ -212,6 +229,7 @@ namespace WeChatMsgHelper
             try
             {
                 listener.Synchronize(roots, true);
+                discoveryTimer.Interval = DiscoveryStableIntervalMs;
                 statusText = "正在监听 " + listener.BoundCount + " 个会话";
                 UpdateTray();
             }
@@ -308,8 +326,48 @@ namespace WeChatMsgHelper
         private void SafeUpdateContextHotkeys()
         {
             if (settingsOpen || exiting) return;
-            try { hotkeys.UpdateWeChatContext(navigator.IsWechatForeground(), navigator.IsMessageInputFocused(), ReportHotkeyFailure); }
+            try
+            {
+                bool foreground = navigator.IsWechatForeground();
+                if (foreground && !wechatWasForeground) BeginBindWechat();
+                wechatWasForeground = foreground;
+                hotkeys.UpdateWeChatContext(foreground, navigator.IsMessageInputFocused(foreground), ReportHotkeyFailure);
+                UpdateHotkeyFallbackTimer();
+            }
             catch (Exception ex) { AppLog.Write("微信快捷键上下文探测失败：" + ex.Message); }
+        }
+
+        private void BeginUpdateVoipContext()
+        {
+            if (settingsOpen || exiting || Interlocked.Exchange(ref voipProbePending, 1) != 0) return;
+            if (!ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool available = false;
+                Exception error = null;
+                try { available = navigator.HasVoipTrayWindow(); }
+                catch (Exception ex) { error = ex; }
+                Dispatch(delegate
+                {
+                    Interlocked.Exchange(ref voipProbePending, 0);
+                    if (settingsOpen || exiting) return;
+                    if (error != null)
+                    {
+                        AppLog.Write("VOIP window detection failed: " + error.Message);
+                        return;
+                    }
+                    hotkeys.UpdateVoipContext(available, ReportHotkeyFailure);
+                    UpdateHotkeyFallbackTimer();
+                });
+            })) Interlocked.Exchange(ref voipProbePending, 0);
+        }
+
+        private void UpdateHotkeyFallbackTimer()
+        {
+            if (hotkeys.HasFallbackHotkeys)
+            {
+                if (!hotkeyFallbackTimer.Enabled) hotkeyFallbackTimer.Start();
+            }
+            else if (hotkeyFallbackTimer.Enabled) hotkeyFallbackTimer.Stop();
         }
 
         private void ToggleListening()
@@ -348,6 +406,8 @@ namespace WeChatMsgHelper
             settingsOpen = true;
             discoveryTimer.Stop();
             contextTimer.Stop();
+            voipTimer.Stop();
+            hotkeyFallbackTimer.Stop();
             if (listener != null) listener.Suspend();
             try
             {
@@ -381,7 +441,9 @@ namespace WeChatMsgHelper
                 {
                     discoveryTimer.Start();
                     contextTimer.Start();
+                    voipTimer.Start();
                     BeginBindWechat();
+                    BeginUpdateVoipContext();
                 }
             }
         }
@@ -479,6 +541,30 @@ namespace WeChatMsgHelper
             if (tray != null) tray.ShowMessage("微信消息助手", text, ToolTipIcon.Warning);
         }
 
+        private void ExportLog()
+        {
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            using (SaveFileDialog dialog = new SaveFileDialog())
+            {
+                dialog.Title = "导出微信消息助手日志";
+                dialog.Filter = "日志文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
+                dialog.DefaultExt = "txt";
+                dialog.AddExtension = true;
+                dialog.FileName = "WeChatMsgHelper-log-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt";
+                if (Directory.Exists(desktop)) dialog.InitialDirectory = desktop;
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+                AppLog.Write("用户请求导出日志");
+                string error;
+                if (AppLog.TryExport(dialog.FileName, out error))
+                {
+                    tray.ShowMessage("日志导出成功", "请将此日志文件发送给开发者：" + dialog.FileName, ToolTipIcon.Info);
+                    return;
+                }
+                ShowWarning("导出日志失败：" + error);
+            }
+        }
+
         private async void CheckForUpdates(bool manual)
         {
             if (updateCheckPending || exiting) return;
@@ -532,7 +618,7 @@ namespace WeChatMsgHelper
 
         private void ShowCurrentReleaseNotes()
         {
-            using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 1.8.0 更新日志", UpdateReleaseNotes.Current, false))
+            using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 1.8.1 更新日志", UpdateReleaseNotes.Current, false))
                 form.ShowDialog();
         }
 
@@ -567,6 +653,7 @@ namespace WeChatMsgHelper
             // disposal can block inside external components; Windows releases those
             // process resources, so do not keep the hidden process alive for cleanup.
             if (speechQueue != null) speechQueue.ShutdownWithAnnouncement();
+            AppLog.DeleteCurrent();
             Environment.Exit(0);
         }
 

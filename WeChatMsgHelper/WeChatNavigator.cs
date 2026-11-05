@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Automation;
 
 namespace WeChatMsgHelper
@@ -15,25 +16,48 @@ namespace WeChatMsgHelper
         private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int GetClassName(IntPtr windowHandle, StringBuilder className, int maximumCount);
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ShowWindowAsync(IntPtr windowHandle, int command);
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetForegroundWindow(IntPtr windowHandle);
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr windowHandle);
+
+        private const int SwRestore = 9;
+        private const int ProcessCacheSeconds = 10;
+        private const string VoipWindowClassName = "mmui::VOIPTrayWindow";
+        private const string VoipWindowAutomationId = "VOIPTrayWindow";
+        private readonly object voipWindowSync = new object();
+        private readonly object processCacheSync = new object();
+        private readonly Dictionary<IntPtr, bool> knownVoipCandidates = new Dictionary<IntPtr, bool>();
+        private readonly Dictionary<uint, bool> weixinProcessCache = new Dictionary<uint, bool>();
+        private IntPtr cachedVoipWindowHandle;
+        private DateTime processCacheExpiresAt;
 
         internal bool IsWechatForeground()
         {
             IntPtr handle = GetForegroundWindow();
             if (handle == IntPtr.Zero) return false;
-            try
+            StringBuilder className = new StringBuilder(64);
+            if (GetClassName(handle, className, className.Capacity) != 0)
             {
-                AutomationElement element = AutomationElement.FromHandle(handle);
-                string className = element.Current.ClassName;
-                return className == "mmui::MainWindow" || className == "mmui::ChatSingleWindow";
+                string value = className.ToString();
+                if (value == "mmui::MainWindow" || value == "mmui::ChatSingleWindow") return true;
+                if (value.EndsWith("QWindowIcon", StringComparison.Ordinal)) return IsWeixinWindow(handle);
             }
-            catch { return IsWeixinWindow(handle); }
+            return IsWeixinWindow(handle);
         }
 
-        internal bool IsMessageInputFocused()
+        internal bool IsMessageInputFocused(bool wechatForeground)
         {
-            if (!IsWechatForeground()) return false;
+            if (!wechatForeground) return false;
             try
             {
                 AutomationElement focused = AutomationElement.FocusedElement;
@@ -126,8 +150,26 @@ namespace WeChatMsgHelper
 
         internal bool FocusVoipTrayWindow()
         {
-            AutomationElement window = FindTopLevel("mmui::VOIPTrayWindow", "VOIPTrayWindow", ControlType.Window);
-            return window != null && SetFocus(window);
+            IntPtr handle = FindVoipTrayWindowHandle();
+            if (handle == IntPtr.Zero) return false;
+            bool activated = false;
+            try
+            {
+                ShowWindowAsync(handle, SwRestore);
+                activated = SetForegroundWindow(handle);
+            }
+            catch { }
+            try
+            {
+                AutomationElement window = AutomationElement.FromHandle(handle);
+                return SetFocus(window) || activated;
+            }
+            catch { return activated; }
+        }
+
+        internal bool HasVoipTrayWindow()
+        {
+            return FindVoipTrayWindowHandle() != IntPtr.Zero;
         }
 
         internal string GetChatIdentity(AutomationElement root)
@@ -177,11 +219,12 @@ namespace WeChatMsgHelper
             return result;
         }
 
-        private static AutomationElement FindTopLevel(string className, string automationId, ControlType controlType)
+        private AutomationElement FindTopLevel(string className, string automationId, ControlType controlType)
         {
             AutomationElement found = null;
             EnumWindows(delegate(IntPtr handle, IntPtr parameter)
             {
+                if (!IsWeixinTopLevelWindow(handle)) return true;
                 try
                 {
                     AutomationElement element = AutomationElement.FromHandle(handle);
@@ -196,16 +239,103 @@ namespace WeChatMsgHelper
             return found;
         }
 
-        private static bool IsWeixinWindow(IntPtr handle)
+        private IntPtr FindVoipTrayWindowHandle()
+        {
+            lock (voipWindowSync)
+            {
+                Dictionary<IntPtr, bool> currentCandidates = new Dictionary<IntPtr, bool>();
+                EnumWindows(delegate(IntPtr handle, IntPtr parameter)
+                {
+                    StringBuilder className = new StringBuilder(64);
+                    if (GetClassName(handle, className, className.Capacity) == 0) return true;
+                    string value = className.ToString();
+                    if (!value.Equals(VoipWindowClassName, StringComparison.Ordinal) &&
+                        !value.EndsWith("QWindowIcon", StringComparison.Ordinal)) return true;
+                    if (IsWeixinWindow(handle)) currentCandidates[handle] = IsWindowVisible(handle);
+                    return true;
+                }, IntPtr.Zero);
+
+                bool candidatesChanged = currentCandidates.Count != knownVoipCandidates.Count;
+                if (!candidatesChanged)
+                {
+                    foreach (KeyValuePair<IntPtr, bool> candidate in currentCandidates)
+                    {
+                        bool knownVisibility;
+                        if (!knownVoipCandidates.TryGetValue(candidate.Key, out knownVisibility) ||
+                            knownVisibility != candidate.Value)
+                        {
+                            candidatesChanged = true;
+                            break;
+                        }
+                    }
+                }
+                if (!candidatesChanged)
+                    return currentCandidates.ContainsKey(cachedVoipWindowHandle) ? cachedVoipWindowHandle : IntPtr.Zero;
+
+                knownVoipCandidates.Clear();
+                foreach (KeyValuePair<IntPtr, bool> candidate in currentCandidates)
+                    knownVoipCandidates[candidate.Key] = candidate.Value;
+                cachedVoipWindowHandle = IntPtr.Zero;
+
+                foreach (KeyValuePair<IntPtr, bool> candidate in currentCandidates)
+                {
+                    StringBuilder className = new StringBuilder(64);
+                    if (GetClassName(candidate.Key, className, className.Capacity) == 0) continue;
+                    if (className.ToString().Equals(VoipWindowClassName, StringComparison.Ordinal))
+                    {
+                        cachedVoipWindowHandle = candidate.Key;
+                        break;
+                    }
+                    if (!candidate.Value) continue;
+                    try
+                    {
+                        AutomationElement element = AutomationElement.FromHandle(candidate.Key);
+                        if (element.Current.AutomationId.Equals(VoipWindowAutomationId, StringComparison.Ordinal))
+                        {
+                            cachedVoipWindowHandle = candidate.Key;
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+                return cachedVoipWindowHandle;
+            }
+        }
+
+        private bool IsWeixinTopLevelWindow(IntPtr handle)
+        {
+            StringBuilder className = new StringBuilder(64);
+            if (GetClassName(handle, className, className.Capacity) == 0) return false;
+            string value = className.ToString();
+            if (!value.StartsWith("mmui::", StringComparison.Ordinal) &&
+                !value.EndsWith("QWindowIcon", StringComparison.Ordinal)) return false;
+            return IsWeixinWindow(handle);
+        }
+
+        private bool IsWeixinWindow(IntPtr handle)
         {
             uint processId;
             GetWindowThreadProcessId(handle, out processId);
-            try
+            if (processId == 0) return false;
+            lock (processCacheSync)
             {
-                using (Process process = Process.GetProcessById(unchecked((int)processId)))
-                    return process.ProcessName.Equals("Weixin", StringComparison.OrdinalIgnoreCase);
+                DateTime now = DateTime.UtcNow;
+                if (now >= processCacheExpiresAt)
+                {
+                    weixinProcessCache.Clear();
+                    processCacheExpiresAt = now.AddSeconds(ProcessCacheSeconds);
+                }
+                bool isWeixin;
+                if (weixinProcessCache.TryGetValue(processId, out isWeixin)) return isWeixin;
+                try
+                {
+                    using (Process process = Process.GetProcessById(unchecked((int)processId)))
+                        isWeixin = process.ProcessName.Equals("Weixin", StringComparison.OrdinalIgnoreCase);
+                }
+                catch { isWeixin = false; }
+                weixinProcessCache[processId] = isWeixin;
+                return isWeixin;
             }
-            catch { return false; }
         }
     }
 }

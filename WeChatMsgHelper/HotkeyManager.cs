@@ -51,11 +51,14 @@ namespace WeChatMsgHelper
         private readonly HashSet<int> fallbackPressed = new HashSet<int>();
         private bool wechatContextActive;
         private bool inputContextActive;
+        private bool voipWindowActive;
 
         internal HotkeyManager(IntPtr handle)
         {
             this.handle = handle;
         }
+
+        internal bool HasFallbackHotkeys { get { return fallback.Count > 0; } }
 
         internal void RegisterAll(AppConfig config, Action<string> onFailure)
         {
@@ -75,16 +78,15 @@ namespace WeChatMsgHelper
                 {
                     Register(FocusOfficialAccountsId, "Alt+P", onFailure);
                     Register(FocusContactsId, "Alt+T", onFailure);
-                    Register(FocusVoipId, "Alt+V", onFailure);
                     Register(NvdaModeId, "F3", onFailure);
                 }
                 else
                 {
                     Unregister(FocusOfficialAccountsId);
                     Unregister(FocusContactsId);
-                    Unregister(FocusVoipId);
                     Unregister(NvdaModeId);
                 }
+                UpdateVoipRegistration(onFailure);
             }
             bool shouldEnableInput = foreground && inputFocused;
             if (shouldEnableInput == inputContextActive) return;
@@ -103,6 +105,13 @@ namespace WeChatMsgHelper
                 Unregister(ReviewFirstId);
                 Unregister(ReviewLastId);
             }
+        }
+
+        internal void UpdateVoipContext(bool windowAvailable, Action<string> onFailure)
+        {
+            if (windowAvailable == voipWindowActive) return;
+            voipWindowActive = windowAvailable;
+            UpdateVoipRegistration(onFailure);
         }
 
         public void Dispose() { UnregisterAll(); }
@@ -157,6 +166,15 @@ namespace WeChatMsgHelper
             fallbackPressed.Clear();
             wechatContextActive = false;
             inputContextActive = false;
+            voipWindowActive = false;
+        }
+
+        private void UpdateVoipRegistration(Action<string> onFailure)
+        {
+            if (wechatContextActive || voipWindowActive)
+                Register(FocusVoipId, "Alt+V", onFailure);
+            else
+                Unregister(FocusVoipId);
         }
 
         private static bool IsDown(FallbackHotkey hotkey)

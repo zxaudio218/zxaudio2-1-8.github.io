@@ -16,7 +16,8 @@ namespace WeChatMsgHelper
         private readonly Dictionary<string, MenuItem> channelItems = new Dictionary<string, MenuItem>(StringComparer.OrdinalIgnoreCase);
 
         internal TrayIcon(Action toggleListening, Action<NotificationMode> setMode, Action<string> setSpeechChannel,
-            Action readLatest, Action testSpeech, Action openSettings, Action checkUpdates, Action showReleaseNotes, Action exit)
+            Action readLatest, Action testSpeech, Action openSettings, Action checkUpdates, Action showReleaseNotes,
+            Action exportLog, Action exit)
         {
             menu = new ContextMenu();
             statusItem = new MenuItem("正在启动...") { Enabled = false };
@@ -45,6 +46,7 @@ namespace WeChatMsgHelper
             menu.MenuItems.Add(new MenuItem("-"));
             menu.MenuItems.Add(new MenuItem("检查更新", delegate { checkUpdates(); }));
             menu.MenuItems.Add(new MenuItem("更新日志", delegate { showReleaseNotes(); }));
+            menu.MenuItems.Add(new MenuItem("导出异常日志", delegate { exportLog(); }));
             menu.MenuItems.Add(new MenuItem("-"));
             menu.MenuItems.Add(new MenuItem("退出", delegate { exit(); }));
 

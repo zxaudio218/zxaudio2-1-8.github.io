@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Automation;
 
 namespace WeChatMsgHelper
@@ -27,30 +28,84 @@ namespace WeChatMsgHelper
         private readonly bool readNonTextMessages;
         private sealed class InputSample
         {
+            internal string Scope;
             internal string Text;
             internal DateTime At;
+            internal bool Consumed;
         }
-        private readonly Queue<InputSample> recentInputs = new Queue<InputSample>();
+        private sealed class EmojiSendSample
+        {
+            internal string Scope;
+            internal string Name;
+            internal DateTime At;
+        }
+        private readonly Dictionary<string, InputSample> currentInputs = new Dictionary<string, InputSample>(StringComparer.Ordinal);
+        private readonly List<InputSample> recentlySentInputs = new List<InputSample>();
+        private readonly List<EmojiSendSample> recentlySentEmojis = new List<EmojiSendSample>();
+        private int unknownDirectionDiagnosticsRemaining = 8;
+        private int inputMatchDiagnosticsRemaining = 8;
 
         internal MessageExtractor(bool readNonTextMessages)
         {
             this.readNonTextMessages = readNonTextMessages;
         }
 
-        internal void NoteInputText(string text)
+        internal void NoteInputText(string scope, string text)
         {
             string cleaned = Clean(text);
-            if (cleaned.Length == 0) return;
+            string normalizedScope = scope ?? string.Empty;
+            string normalizedText = NormalizeForMatch(cleaned);
+            DateTime now = DateTime.UtcNow;
             lock (syncRoot)
             {
-                recentInputs.Enqueue(new InputSample { Text = NormalizeForMatch(cleaned), At = DateTime.UtcNow });
-                while (recentInputs.Count > 16) recentInputs.Dequeue();
+                RemoveExpiredInputSamples(now);
+                InputSample current;
+                currentInputs.TryGetValue(normalizedScope, out current);
+                if (normalizedText.Length > 0)
+                {
+                    if (current == null)
+                    {
+                        current = new InputSample { Scope = normalizedScope };
+                        currentInputs[normalizedScope] = current;
+                    }
+                    if (!string.Equals(current.Text, normalizedText, StringComparison.Ordinal)) current.Consumed = false;
+                    current.Text = normalizedText;
+                    current.At = now;
+                    return;
+                }
+
+                if (current != null)
+                {
+                    currentInputs.Remove(normalizedScope);
+                    if (!current.Consumed && !string.IsNullOrEmpty(current.Text))
+                    {
+                        current.At = now;
+                        recentlySentInputs.Add(current);
+                        while (recentlySentInputs.Count > 32) recentlySentInputs.RemoveAt(0);
+                    }
+                }
             }
         }
 
         internal bool Prime(AutomationElement root)
         {
             return Prime(root, string.Empty);
+        }
+
+        internal void NoteEmojiSent(string scope, string name)
+        {
+            DateTime now = DateTime.UtcNow;
+            lock (syncRoot)
+            {
+                RemoveExpiredInputSamples(now);
+                recentlySentEmojis.Add(new EmojiSendSample
+                {
+                    Scope = scope ?? string.Empty,
+                    Name = name ?? string.Empty,
+                    At = now
+                });
+                while (recentlySentEmojis.Count > 8) recentlySentEmojis.RemoveAt(0);
+            }
         }
 
         internal bool Prime(AutomationElement root, string scope)
@@ -97,7 +152,9 @@ namespace WeChatMsgHelper
                 string signature = CreateSignature(scope, key, text);
                 if (IsSeen(signature)) continue;
                 Remember(signature);
-                messages.Add(new MessageData { Key = key, Text = text, Direction = GuessDirection(list, item) });
+                MessageDirection direction = GuessDirection(list, item, scope);
+                if (direction == MessageDirection.Unknown) LogUnknownDirection(list, item, text);
+                messages.Add(new MessageData { Key = key, Text = text, Direction = direction });
             }
             return messages;
         }
@@ -122,7 +179,7 @@ namespace WeChatMsgHelper
                     string key = GetRuntimeId(item);
                     string text = ReadMessageText(item);
                     if (key.Length == 0 || text.Length == 0) continue;
-                    messages.Add(new MessageData { Key = key, Text = text, Direction = GuessDirection(list, item) });
+                    messages.Add(new MessageData { Key = key, Text = text, Direction = GuessDirection(list, item, string.Empty) });
                 }
             }
             catch { }
@@ -154,7 +211,7 @@ namespace WeChatMsgHelper
             if (deduplicate && IsSeen(signature)) return false;
 
             if (deduplicate) Remember(signature);
-            data = new MessageData { Key = key, Text = text, Direction = GuessDirection(list, item) };
+            data = new MessageData { Key = key, Text = text, Direction = GuessDirection(list, item, scope) };
             return true;
         }
 
@@ -222,12 +279,13 @@ namespace WeChatMsgHelper
             return (scope ?? string.Empty) + "\u001e" + key + "\u001f" + (text ?? string.Empty);
         }
 
-        private MessageDirection GuessDirection(AutomationElement list, AutomationElement item)
+        private MessageDirection GuessDirection(AutomationElement list, AutomationElement item, string scope)
         {
             try
             {
                 string messageText = Clean(ReadName(item));
-                if (MatchesRecentInput(messageText)) return MessageDirection.Outgoing;
+                if (MatchesRecentInput(scope, messageText)) return MessageDirection.Outgoing;
+                if (MatchesRecentEmojiSend(scope, messageText)) return MessageDirection.Outgoing;
                 string hints = ((item.Current.AutomationId ?? string.Empty) + " " + (item.Current.ClassName ?? string.Empty)).ToLowerInvariant();
                 if (hints.Contains("send") || hints.Contains("out") || hints.Contains("right") || hints.Contains("self"))
                     return MessageDirection.Outgoing;
@@ -260,37 +318,131 @@ namespace WeChatMsgHelper
             {
                 AutomationElementCollection descendants = item.FindAll(TreeScope.Descendants, Condition.TrueCondition);
                 for (int index = 0; index < descendants.Count; index++)
+                    ScoreContentCandidate(listRect, descendants[index], normalizedMessage, ref best, ref bestScore, ref bestArea);
+
+                // Qt exposes some chat bubble children only in the raw UIA view.
+                foreach (AutomationElement element in GetRawDescendants(item, 96))
+                    ScoreContentCandidate(listRect, element, normalizedMessage, ref best, ref bestScore, ref bestArea);
+            }
+            catch { }
+            return best;
+        }
+
+        private static void ScoreContentCandidate(System.Windows.Rect listRect, AutomationElement element,
+            string normalizedMessage, ref System.Windows.Rect best, ref int bestScore, ref double bestArea)
+        {
+            AutomationElement.AutomationElementInformation current = element.Current;
+            System.Windows.Rect bounds = current.BoundingRectangle;
+            if (bounds.Width <= 1 || bounds.Height <= 1 || bounds.Width >= listRect.Width * 0.88) return;
+            if (bounds.Right < listRect.Left || bounds.Left > listRect.Right) return;
+
+            string name = Clean(current.Name);
+            string normalizedName = NormalizeForMatch(name);
+            string hints = ((current.AutomationId ?? string.Empty) + " " +
+                (current.ClassName ?? string.Empty)).ToLowerInvariant();
+            int score = 0;
+            if (normalizedMessage.Length > 0 && normalizedName == normalizedMessage) score += 100;
+            else if (normalizedName.Length > 0 && normalizedMessage.Length > 0 &&
+                (normalizedName.Contains(normalizedMessage) || normalizedMessage.Contains(normalizedName))) score += 45;
+            if (hints.Contains("bubble") || hints.Contains("avatar") || hints.Contains("message") ||
+                hints.Contains("content") || hints.Contains("text") || hints.Contains("voice") || hints.Contains("image")) score += 20;
+            ControlType type = current.ControlType;
+            if (type == ControlType.Text || type == ControlType.Image || type == ControlType.Button || type == ControlType.Custom) score += 5;
+            if (name.Length > 0) score += 5;
+
+            double area = bounds.Width * bounds.Height;
+            if (score > bestScore || (score == bestScore && area > bestArea))
+            {
+                best = bounds;
+                bestScore = score;
+                bestArea = area;
+            }
+        }
+
+        private static IList<AutomationElement> GetRawDescendants(AutomationElement root, int maximumCount)
+        {
+            List<AutomationElement> result = new List<AutomationElement>();
+            if (root == null || maximumCount <= 0) return result;
+            try
+            {
+                TreeWalker walker = TreeWalker.RawViewWalker;
+                Stack<AutomationElement> pending = new Stack<AutomationElement>();
+                AutomationElement child = walker.GetFirstChild(root);
+                while (child != null)
                 {
-                    AutomationElement element = descendants[index];
-                    System.Windows.Rect bounds = element.Current.BoundingRectangle;
-                    if (bounds.Width <= 1 || bounds.Height <= 1 || bounds.Width >= listRect.Width * 0.88) continue;
-                    if (bounds.Right < listRect.Left || bounds.Left > listRect.Right) continue;
-
-                    string name = Clean(element.Current.Name);
-                    string normalizedName = NormalizeForMatch(name);
-                    string hints = ((element.Current.AutomationId ?? string.Empty) + " " +
-                        (element.Current.ClassName ?? string.Empty)).ToLowerInvariant();
-                    int score = 0;
-                    if (normalizedMessage.Length > 0 && normalizedName == normalizedMessage) score += 100;
-                    else if (normalizedName.Length > 0 && normalizedMessage.Length > 0 &&
-                        (normalizedName.Contains(normalizedMessage) || normalizedMessage.Contains(normalizedName))) score += 45;
-                    if (hints.Contains("bubble") || hints.Contains("avatar") || hints.Contains("message") ||
-                        hints.Contains("content") || hints.Contains("text") || hints.Contains("voice") || hints.Contains("image")) score += 20;
-                    ControlType type = element.Current.ControlType;
-                    if (type == ControlType.Text || type == ControlType.Image || type == ControlType.Button || type == ControlType.Custom) score += 5;
-                    if (name.Length > 0) score += 5;
-
-                    double area = bounds.Width * bounds.Height;
-                    if (score > bestScore || (score == bestScore && area > bestArea))
+                    pending.Push(child);
+                    child = walker.GetNextSibling(child);
+                }
+                while (pending.Count > 0 && result.Count < maximumCount)
+                {
+                    AutomationElement element = pending.Pop();
+                    result.Add(element);
+                    child = walker.GetFirstChild(element);
+                    while (child != null)
                     {
-                        best = bounds;
-                        bestScore = score;
-                        bestArea = area;
+                        pending.Push(child);
+                        child = walker.GetNextSibling(child);
                     }
                 }
             }
             catch { }
-            return best;
+            return result;
+        }
+
+        private void LogUnknownDirection(AutomationElement list, AutomationElement item, string messageText)
+        {
+            if (Interlocked.Decrement(ref unknownDirectionDiagnosticsRemaining) < 0) return;
+            try
+            {
+                System.Windows.Rect listRect = list.Current.BoundingRectangle;
+                System.Windows.Rect itemRect = item.Current.BoundingRectangle;
+                AppLog.Write("未知方向诊断：列表=" + FormatRectangle(listRect) + "，消息项=" + FormatRectangle(itemRect) +
+                    "，消息长度=" + (messageText ?? string.Empty).Length);
+
+                string normalizedMessage = NormalizeForMatch(messageText);
+                AutomationElementCollection descendants = item.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                int count = Math.Min(descendants.Count, 24);
+                for (int index = 0; index < count; index++)
+                {
+                    AutomationElement element = descendants[index];
+                    AutomationElement.AutomationElementInformation current = element.Current;
+                    string name = Clean(current.Name);
+                    string normalizedName = NormalizeForMatch(name);
+                    bool matchesMessage = normalizedMessage.Length > 0 && normalizedName == normalizedMessage;
+                    string controlType = current.ControlType == null ? string.Empty : current.ControlType.ProgrammaticName;
+                    AppLog.Write("未知方向子控件[" + index + "]：类型=" + controlType +
+                        "，AutomationId=" + (current.AutomationId ?? string.Empty) +
+                        "，ClassName=" + (current.ClassName ?? string.Empty) +
+                        "，坐标=" + FormatRectangle(current.BoundingRectangle) +
+                        "，文字长度=" + name.Length + "，匹配正文=" + matchesMessage);
+                }
+
+                IList<AutomationElement> rawDescendants = GetRawDescendants(item, 24);
+                AppLog.Write("未知方向原始子控件数=" + rawDescendants.Count);
+                for (int index = 0; index < rawDescendants.Count; index++)
+                {
+                    AutomationElement.AutomationElementInformation current = rawDescendants[index].Current;
+                    string name = Clean(current.Name);
+                    string normalizedName = NormalizeForMatch(name);
+                    bool matchesMessage = normalizedMessage.Length > 0 && normalizedName == normalizedMessage;
+                    string controlType = current.ControlType == null ? string.Empty : current.ControlType.ProgrammaticName;
+                    AppLog.Write("未知方向原始子控件[" + index + "]：类型=" + controlType +
+                        "，AutomationId=" + (current.AutomationId ?? string.Empty) +
+                        "，ClassName=" + (current.ClassName ?? string.Empty) +
+                        "，坐标=" + FormatRectangle(current.BoundingRectangle) +
+                        "，文字长度=" + name.Length + "，匹配正文=" + matchesMessage);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("未知方向诊断失败：" + ex.GetType().Name + "，HRESULT=0x" + ex.HResult.ToString("X8"));
+            }
+        }
+
+        private static string FormatRectangle(System.Windows.Rect rectangle)
+        {
+            return Math.Round(rectangle.Left) + "," + Math.Round(rectangle.Top) + "," +
+                Math.Round(rectangle.Width) + "x" + Math.Round(rectangle.Height);
         }
 
         private static string InferNonText(AutomationElement item)
@@ -327,17 +479,135 @@ namespace WeChatMsgHelper
             return Regex.Replace(text, "(?:\\r?\\n\\s*){3,}", Environment.NewLine + Environment.NewLine);
         }
 
-        private bool MatchesRecentInput(string text)
+        private bool MatchesRecentInput(string scope, string text)
         {
             string normalized = NormalizeForMatch(text);
             if (normalized.Length == 0) return false;
             DateTime now = DateTime.UtcNow;
+            string normalizedScope = scope ?? string.Empty;
             lock (syncRoot)
             {
-                foreach (InputSample sample in recentInputs)
-                    if (now - sample.At < TimeSpan.FromSeconds(15) && sample.Text == normalized) return true;
+                RemoveExpiredInputSamples(now);
+                InputSample current;
+                if (currentInputs.TryGetValue(normalizedScope, out current) &&
+                    now - current.At < TimeSpan.FromSeconds(30) &&
+                    MatchesSentText(current.Text, normalized, now - current.At))
+                {
+                    current.Consumed = true;
+                    if (!string.Equals(current.Text, normalized, StringComparison.Ordinal))
+                        AppLog.Write("发送文本已按引用/@规则匹配，会话=" + normalizedScope);
+                    return true;
+                }
+
+                bool hadCandidate = false;
+                int candidateLength = 0;
+                for (int index = recentlySentInputs.Count - 1; index >= 0; index--)
+                {
+                    InputSample sample = recentlySentInputs[index];
+                    if (!string.Equals(sample.Scope, normalizedScope, StringComparison.Ordinal)) continue;
+                    hadCandidate = true;
+                    candidateLength = sample.Text == null ? 0 : sample.Text.Length;
+                    if (!MatchesSentText(sample.Text, normalized, now - sample.At)) continue;
+                    recentlySentInputs.RemoveAt(index);
+                    if (!string.Equals(sample.Text, normalized, StringComparison.Ordinal))
+                        AppLog.Write("发送文本已按引用/@规则匹配，会话=" + normalizedScope);
+                    return true;
+                }
+                if (hadCandidate && inputMatchDiagnosticsRemaining > 0)
+                {
+                    inputMatchDiagnosticsRemaining--;
+                    AppLog.Write("最近发送文本未匹配，会话=" + normalizedScope +
+                        "，输入长度=" + candidateLength + "，消息长度=" + normalized.Length);
+                }
             }
             return false;
+        }
+
+        private static bool MatchesSentText(string sentText, string messageText, TimeSpan age)
+        {
+            string sent = sentText ?? string.Empty;
+            string message = messageText ?? string.Empty;
+            if (sent.Length == 0 || message.Length == 0) return false;
+            if (string.Equals(sent, message, StringComparison.Ordinal)) return true;
+            if (age >= TimeSpan.FromSeconds(15)) return false;
+
+            if (message.StartsWith(sent, StringComparison.Ordinal) ||
+                message.EndsWith(sent, StringComparison.Ordinal)) return true;
+            if (sent.StartsWith(message, StringComparison.Ordinal) ||
+                sent.EndsWith(message, StringComparison.Ordinal))
+                return message.Length >= 2 || age < TimeSpan.FromSeconds(3);
+
+            int shorterLength = Math.Min(sent.Length, message.Length);
+            return shorterLength >= 2 &&
+                (message.IndexOf(sent, StringComparison.Ordinal) >= 0 ||
+                 sent.IndexOf(message, StringComparison.Ordinal) >= 0);
+        }
+
+        private bool MatchesRecentEmojiSend(string scope, string text)
+        {
+            DateTime now = DateTime.UtcNow;
+            string normalizedScope = scope ?? string.Empty;
+            bool genericEmojiMessage = IsEmojiMessage(text);
+            lock (syncRoot)
+            {
+                RemoveExpiredInputSamples(now);
+                for (int index = 0; index < recentlySentEmojis.Count; index++)
+                {
+                    EmojiSendSample sample = recentlySentEmojis[index];
+                    if (!string.Equals(sample.Scope, normalizedScope, StringComparison.Ordinal)) continue;
+                    if (!genericEmojiMessage && !MatchesEmojiName(sample.Name, text)) continue;
+                    recentlySentEmojis.RemoveAt(index);
+                    AppLog.Write("表情发送动作已匹配到新消息，会话=" + normalizedScope);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool IsEmojiMessage(string text)
+        {
+            string value = Clean(text);
+            return value.IndexOf("表情", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("emoji", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("emoticon", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("sticker", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool MatchesEmojiName(string invokedName, string messageText)
+        {
+            string name = NormalizeEmojiName(invokedName);
+            string message = NormalizeEmojiName(messageText);
+            if (name.Length == 0 || message.Length == 0) return false;
+            if (string.Equals(name, message, StringComparison.OrdinalIgnoreCase)) return true;
+            return name.Length >= 2 && message.Length >= 2 &&
+                (name.EndsWith(message, StringComparison.OrdinalIgnoreCase) ||
+                 message.EndsWith(name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static string NormalizeEmojiName(string value)
+        {
+            string normalized = NormalizeForMatch(value).Trim('[', ']', '【', '】', '(', ')', '（', '）');
+            if (normalized.StartsWith("表情：", StringComparison.OrdinalIgnoreCase)) normalized = normalized.Substring(3);
+            if (normalized.StartsWith("表情:", StringComparison.OrdinalIgnoreCase)) normalized = normalized.Substring(3);
+            return normalized;
+        }
+
+        private void RemoveExpiredInputSamples(DateTime now)
+        {
+            for (int index = recentlySentInputs.Count - 1; index >= 0; index--)
+                if (now - recentlySentInputs[index].At >= TimeSpan.FromSeconds(15)) recentlySentInputs.RemoveAt(index);
+            for (int index = recentlySentEmojis.Count - 1; index >= 0; index--)
+                if (now - recentlySentEmojis[index].At >= TimeSpan.FromSeconds(8)) recentlySentEmojis.RemoveAt(index);
+
+            List<string> expiredScopes = null;
+            foreach (KeyValuePair<string, InputSample> pair in currentInputs)
+            {
+                if (now - pair.Value.At < TimeSpan.FromMinutes(2)) continue;
+                if (expiredScopes == null) expiredScopes = new List<string>();
+                expiredScopes.Add(pair.Key);
+            }
+            if (expiredScopes == null) return;
+            foreach (string expiredScope in expiredScopes) currentInputs.Remove(expiredScope);
         }
 
         private static string NormalizeForMatch(string text)

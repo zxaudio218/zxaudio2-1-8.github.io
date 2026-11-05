@@ -13,6 +13,7 @@ namespace WeChatMsgHelper
             internal AutomationElement Root;
             internal List<MessageData> Messages = new List<MessageData>();
             internal int CurrentIndex = -1;
+            internal DateTime LastUsedUtc;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -40,6 +41,7 @@ namespace WeChatMsgHelper
         private const byte RightAlt = 0xA5;
         private const int WheelDelta = 120;
         private const int MaximumMessages = 500;
+        private const int MaximumStates = 32;
         private readonly Dictionary<string, ReviewState> states = new Dictionary<string, ReviewState>(StringComparer.Ordinal);
         private readonly WeChatNavigator navigator;
         private readonly MessageExtractor extractor;
@@ -119,8 +121,28 @@ namespace WeChatMsgHelper
                 states[identity] = state;
             }
             state.Root = root;
+            state.LastUsedUtc = DateTime.UtcNow;
+            TrimStates(identity);
             Merge(state, visible);
             return state.Messages.Count == 0 ? null : state;
+        }
+
+        private void TrimStates(string currentIdentity)
+        {
+            while (states.Count > MaximumStates)
+            {
+                string oldestIdentity = null;
+                DateTime oldestUse = DateTime.MaxValue;
+                foreach (KeyValuePair<string, ReviewState> pair in states)
+                {
+                    if (string.Equals(pair.Key, currentIdentity, StringComparison.Ordinal)) continue;
+                    if (pair.Value.LastUsedUtc >= oldestUse) continue;
+                    oldestUse = pair.Value.LastUsedUtc;
+                    oldestIdentity = pair.Key;
+                }
+                if (oldestIdentity == null) return;
+                states.Remove(oldestIdentity);
+            }
         }
 
         private static void Merge(ReviewState state, IList<MessageData> visible)

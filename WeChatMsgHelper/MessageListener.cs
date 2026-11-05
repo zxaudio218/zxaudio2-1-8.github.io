@@ -25,10 +25,16 @@ namespace WeChatMsgHelper
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr windowHandle, uint command);
+
+        private const uint GwOwner = 4;
+
         private readonly MessageExtractor extractor;
         private readonly Action<MessageData> onMessage;
         private readonly Action<MessageData> onConversationOpened;
         private readonly Action<Action> dispatch;
+        private readonly Action requestRebind;
         private readonly System.Windows.Forms.Timer pollTimer;
         private readonly Dictionary<string, Binding> bindings = new Dictionary<string, Binding>(StringComparer.Ordinal);
         private readonly object bindingLock = new object();
@@ -36,16 +42,18 @@ namespace WeChatMsgHelper
         private readonly StructureChangedEventHandler structureHandler;
         private int extractRunning;
         private int extractAgain;
+        private string lastForegroundBindingKey = string.Empty;
         private volatile bool suspended;
         private volatile bool disposed;
 
         internal MessageListener(MessageExtractor extractor, AppConfig config, Action<MessageData> onMessage,
-            Action<MessageData> onConversationOpened, Action<Action> dispatch)
+            Action<MessageData> onConversationOpened, Action<Action> dispatch, Action requestRebind)
         {
             this.extractor = extractor;
             this.onMessage = onMessage;
             this.onConversationOpened = onConversationOpened;
             this.dispatch = dispatch;
+            this.requestRebind = requestRebind;
             propertyHandler = OnPropertyChanged;
             structureHandler = OnStructureChanged;
             pollTimer = new System.Windows.Forms.Timer();
@@ -103,6 +111,19 @@ namespace WeChatMsgHelper
             pollTimer.Interval = Math.Max(200, Math.Min(5000, interval));
             if (IsBound && PollEnabled) pollTimer.Start();
             else pollTimer.Stop();
+        }
+
+        internal void NoteEmojiSent(string name)
+        {
+            string scope = FindActiveBindingKey();
+            if (scope.Length == 0)
+            {
+                AppLog.Write("检测到表情激活动作，但未找到当前微信会话");
+                return;
+            }
+            extractor.NoteEmojiSent(scope, name);
+            AppLog.Write("已记录表情发送动作，会话=" + scope + "，名称=" + (name ?? string.Empty));
+            QueueExtract();
         }
 
         internal void Suspend()
@@ -176,7 +197,7 @@ namespace WeChatMsgHelper
             catch (Exception ex)
             {
                 Unsubscribe(binding);
-                AppLog.Write("订阅会话失败：" + ex.Message);
+                AppLog.Write("订阅会话失败：" + ex.GetType().Name + "，HRESULT=0x" + ex.HResult.ToString("X8") + "，" + ex.Message);
             }
         }
 
@@ -243,7 +264,13 @@ namespace WeChatMsgHelper
         {
             if (suspended || disposed) return;
             AutomationElement input = sender as AutomationElement;
-            if (input != null) NoteInputText(input);
+            if (input == null) return;
+            Binding binding = FindBindingForInput(input);
+            if (binding == null) return;
+            if (args.Property == ValuePattern.ValueProperty && args.NewValue is string)
+                extractor.NoteInputText(binding.Key, (string)args.NewValue);
+            else
+                NoteInputText(binding, input);
         }
 
         private void OnStructureChanged(object sender, StructureChangedEventArgs args)
@@ -259,11 +286,8 @@ namespace WeChatMsgHelper
                 Interlocked.Exchange(ref extractAgain, 1);
                 return;
             }
-            Thread worker = new Thread(ExtractWorker);
-            worker.IsBackground = true;
-            worker.Name = "WeChatMsgHelper Message Extractor";
-            worker.SetApartmentState(ApartmentState.MTA);
-            worker.Start();
+            if (!ThreadPool.QueueUserWorkItem(delegate { ExtractWorker(); }))
+                Interlocked.Exchange(ref extractRunning, 0);
         }
 
         private void ExtractWorker()
@@ -289,6 +313,7 @@ namespace WeChatMsgHelper
 
         private void ExtractAndEmit(IList<Binding> snapshot)
         {
+            RememberForegroundBinding(snapshot);
             foreach (Binding binding in snapshot)
             {
                 if (binding.Removed || suspended || disposed) continue;
@@ -337,15 +362,19 @@ namespace WeChatMsgHelper
         {
             if (binding.Removed) return;
             AppLog.Write("微信消息列表元素失效，准备重绑：" + reason);
-            dispatch(delegate { RemoveBinding(binding.Key); });
+            dispatch(delegate
+            {
+                RemoveBinding(binding.Key);
+                if (requestRebind != null) requestRebind();
+            });
         }
 
         private void SampleInputText(Binding binding)
         {
-            if (Discovery.IsAvailable(binding.Input)) NoteInputText(binding.Input);
+            if (Discovery.IsAvailable(binding.Input)) NoteInputText(binding, binding.Input);
         }
 
-        private void NoteInputText(AutomationElement input)
+        private void NoteInputText(Binding binding, AutomationElement input)
         {
             try
             {
@@ -356,9 +385,51 @@ namespace WeChatMsgHelper
                     if (valuePattern != null) text = valuePattern.Current.Value;
                 }
                 catch { }
-                extractor.NoteInputText(text);
+                extractor.NoteInputText(binding.Key, text);
             }
             catch { }
+        }
+
+        private Binding FindBindingForInput(AutomationElement input)
+        {
+            List<Binding> snapshot;
+            lock (bindingLock) snapshot = new List<Binding>(bindings.Values);
+            foreach (Binding binding in snapshot)
+                if (!binding.Removed && binding.InputSubscribed && SameElement(binding.Input, input)) return binding;
+            return null;
+        }
+
+        private string FindActiveBindingKey()
+        {
+            List<Binding> snapshot;
+            lock (bindingLock) snapshot = new List<Binding>(bindings.Values);
+            int handle = unchecked((int)GetForegroundWindow().ToInt64());
+            for (int depth = 0; depth < 8 && handle != 0; depth++)
+            {
+                foreach (Binding binding in snapshot)
+                {
+                    if (binding.Removed || binding.Handle != handle) continue;
+                    lastForegroundBindingKey = binding.Key;
+                    return binding.Key;
+                }
+                handle = unchecked((int)GetWindow(new IntPtr(handle), GwOwner).ToInt64());
+            }
+
+            foreach (Binding binding in snapshot)
+                if (!binding.Removed && string.Equals(binding.Key, lastForegroundBindingKey, StringComparison.Ordinal))
+                    return binding.Key;
+            return string.Empty;
+        }
+
+        private void RememberForegroundBinding(IList<Binding> snapshot)
+        {
+            int foreground = unchecked((int)GetForegroundWindow().ToInt64());
+            foreach (Binding binding in snapshot)
+            {
+                if (binding.Removed || binding.Handle != foreground) continue;
+                lastForegroundBindingKey = binding.Key;
+                return;
+            }
         }
 
         private static bool SameElement(AutomationElement left, AutomationElement right)
