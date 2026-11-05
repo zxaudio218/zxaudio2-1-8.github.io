@@ -57,6 +57,8 @@ namespace WeChatMsgHelper
         public string Sapi5Voice = string.Empty;
         public int Sapi5Rate;
         public int Sapi5Volume = 100;
+        public string IgnoredUpdateVersion = string.Empty;
+        public string LastShownReleaseNotesVersion = string.Empty;
 
         public static AppConfig Load(string path)
         {
@@ -87,6 +89,8 @@ namespace WeChatMsgHelper
             config.Sapi5Voice = Get(values, "Sapi5.Voice", config.Sapi5Voice);
             config.Sapi5Rate = Clamp(GetInt(values, "Sapi5.Rate", config.Sapi5Rate), -10, 10);
             config.Sapi5Volume = Clamp(GetInt(values, "Sapi5.Volume", config.Sapi5Volume), 0, 100);
+            config.IgnoredUpdateVersion = Get(values, "Update.IgnoredVersion", config.IgnoredUpdateVersion);
+            config.LastShownReleaseNotesVersion = Get(values, "Update.LastShownReleaseNotesVersion", config.LastShownReleaseNotesVersion);
             config.Save();
             return config;
         }
@@ -121,7 +125,11 @@ namespace WeChatMsgHelper
                 "[Sapi5]",
                 "Voice=" + (Sapi5Voice ?? string.Empty),
                 "Rate=" + Sapi5Rate.ToString(CultureInfo.InvariantCulture),
-                "Volume=" + Sapi5Volume.ToString(CultureInfo.InvariantCulture)
+                "Volume=" + Sapi5Volume.ToString(CultureInfo.InvariantCulture),
+                string.Empty,
+                "[Update]",
+                "IgnoredVersion=" + (IgnoredUpdateVersion ?? string.Empty),
+                "LastShownReleaseNotesVersion=" + (LastShownReleaseNotesVersion ?? string.Empty)
             };
             File.WriteAllLines(FilePath, lines, new UTF8Encoding(false));
         }

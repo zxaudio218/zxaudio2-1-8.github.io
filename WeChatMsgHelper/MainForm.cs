@@ -5,7 +5,6 @@ using System.Drawing;
 using System.IO;
 using System.Media;
 using System.Threading;
-using System.Windows.Automation;
 using System.Windows.Forms;
 using WeChatMsgHelper.Channels;
 
@@ -28,11 +27,13 @@ namespace WeChatMsgHelper
         private TrayIcon tray;
         private MessageReviewManager reviewManager;
         private SearchResultAnnouncer searchAnnouncer;
+        private readonly UpdateService updateService = new UpdateService();
         private DateTime suppressUntil;
         private string statusText = "正在启动...";
         private bool exiting;
         private bool settingsOpen;
         private int discoveryPending;
+        private bool updateCheckPending;
 
         public MainForm()
         {
@@ -52,7 +53,8 @@ namespace WeChatMsgHelper
             foreach (string warning in migrationWarnings) AppLog.Write(warning);
             config = LoadConfig();
             MigrateLegacyHotkeys();
-            tray = new TrayIcon(ToggleListening, SetMode, SetSpeechChannel, ReadLatest, TestSpeech, OpenSettings, ExitApplication);
+            tray = new TrayIcon(ToggleListening, SetMode, SetSpeechChannel, ReadLatest, TestSpeech, OpenSettings,
+                delegate { CheckForUpdates(true); }, ShowCurrentReleaseNotes, ExitApplication);
             hotkeys = new HotkeyManager(Handle);
             hotkeys.RegisterAll(config, ReportHotkeyFailure);
             CreateListener();
@@ -72,6 +74,12 @@ namespace WeChatMsgHelper
             BeginBindWechat();
             UpdateTray();
             WarnAboutNvda();
+            BeginInvoke(new Action(delegate
+            {
+                ShowInstalledReleaseNotes();
+                UpdateInstaller.CleanupOldFiles();
+                CheckForUpdates(false);
+            }));
         }
 
         protected override void SetVisibleCore(bool value)
@@ -167,7 +175,7 @@ namespace WeChatMsgHelper
             if (exiting || settingsOpen || Interlocked.Exchange(ref discoveryPending, 1) != 0) return;
             Thread worker = new Thread(new ThreadStart(delegate
             {
-                IList<AutomationElement> roots = null;
+                IList<DiscoveredWechatRoot> roots = null;
                 Exception error = null;
                 try { roots = discovery.FindWechatRoots(); }
                 catch (Exception ex) { error = ex; }
@@ -182,7 +190,7 @@ namespace WeChatMsgHelper
                         UpdateTray();
                         return;
                     }
-                    ApplyWechatRoots(roots ?? new List<AutomationElement>());
+                    ApplyWechatRoots(roots ?? new List<DiscoveredWechatRoot>());
                 });
             }));
             worker.IsBackground = true;
@@ -191,7 +199,7 @@ namespace WeChatMsgHelper
             worker.Start();
         }
 
-        private void ApplyWechatRoots(IList<AutomationElement> roots)
+        private void ApplyWechatRoots(IList<DiscoveredWechatRoot> roots)
         {
             if (roots.Count == 0)
             {
@@ -469,6 +477,82 @@ namespace WeChatMsgHelper
         {
             AppLog.Write(text);
             if (tray != null) tray.ShowMessage("微信消息助手", text, ToolTipIcon.Warning);
+        }
+
+        private async void CheckForUpdates(bool manual)
+        {
+            if (updateCheckPending || exiting) return;
+            updateCheckPending = true;
+            if (manual) tray.ShowMessage("检查更新", "正在检查新版本...", ToolTipIcon.Info);
+            UpdateCheckResult result = await updateService.CheckAsync();
+            updateCheckPending = false;
+            if (exiting) return;
+            if (!string.IsNullOrEmpty(result.Error))
+            {
+                AppLog.Write("检查更新失败：" + result.Error);
+                if (manual) ShowWarning("检查更新失败：" + result.Error);
+                return;
+            }
+            if (!result.HasUpdate)
+            {
+                if (manual) tray.ShowMessage("检查更新", "当前已是最新版本。", ToolTipIcon.Info);
+                return;
+            }
+            if (!manual && string.Equals(config.IgnoredUpdateVersion, result.Manifest.VersionText, StringComparison.OrdinalIgnoreCase)) return;
+
+            using (UpdateDialog dialog = new UpdateDialog(result.Manifest))
+            {
+                dialog.ShowDialog();
+                if (dialog.SelectedAction == UpdateDialogAction.Ignore)
+                {
+                    config.IgnoredUpdateVersion = result.Manifest.VersionText;
+                    SaveConfig();
+                    return;
+                }
+                if (dialog.SelectedAction == UpdateDialogAction.Install) DownloadAndInstallUpdate(result.Manifest);
+            }
+        }
+
+        private async void DownloadAndInstallUpdate(UpdateManifest manifest)
+        {
+            try
+            {
+                tray.ShowMessage("软件更新", "正在下载版本 " + manifest.VersionText + "...", ToolTipIcon.Info);
+                string package = await updateService.DownloadPackageAsync(manifest);
+                updateService.BeginInstall(manifest, package);
+                exiting = true;
+                Application.Exit();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("下载或安装更新失败：" + ex.Message);
+                ShowWarning("更新失败：" + ex.Message);
+            }
+        }
+
+        private void ShowCurrentReleaseNotes()
+        {
+            using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 1.8.0 更新日志", UpdateReleaseNotes.Current, false))
+                form.ShowDialog();
+        }
+
+        private void ShowInstalledReleaseNotes()
+        {
+            InstalledRelease release = UpdateInstaller.ReadInstalledRelease();
+            if (release == null || string.IsNullOrWhiteSpace(release.Version)) return;
+            if (string.Equals(config.LastShownReleaseNotesVersion, release.Version, StringComparison.OrdinalIgnoreCase))
+            {
+                UpdateInstaller.DeleteInstalledRelease();
+                return;
+            }
+            using (ReleaseNotesForm form = new ReleaseNotesForm("已更新到 " + release.Version, release.ReleaseNotes, true))
+            {
+                if (form.ShowDialog() != DialogResult.OK) return;
+            }
+            config.LastShownReleaseNotesVersion = release.Version;
+            config.IgnoredUpdateVersion = string.Empty;
+            SaveConfig();
+            UpdateInstaller.DeleteInstalledRelease();
         }
 
         private void ReportHotkeyFailure(string text)

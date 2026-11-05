@@ -56,6 +56,11 @@ namespace WeChatMsgHelper
         internal bool Prime(AutomationElement root, string scope)
         {
             AutomationElement list = FindMessageList(root);
+            return PrimeList(list, scope);
+        }
+
+        internal bool PrimeList(AutomationElement list, string scope)
+        {
             if (list == null) return false;
             foreach (AutomationElement item in GetMessageItems(list))
             {
@@ -73,8 +78,13 @@ namespace WeChatMsgHelper
 
         internal IList<MessageData> GetNewMessages(AutomationElement root, string scope)
         {
-            List<MessageData> messages = new List<MessageData>();
             AutomationElement list = FindMessageList(root);
+            return GetNewMessagesFromList(list, scope);
+        }
+
+        internal IList<MessageData> GetNewMessagesFromList(AutomationElement list, string scope)
+        {
+            List<MessageData> messages = new List<MessageData>();
             if (list == null) return messages;
             foreach (AutomationElement item in GetMessageItems(list))
             {
@@ -126,8 +136,13 @@ namespace WeChatMsgHelper
 
         internal bool TryGetLatest(AutomationElement root, bool deduplicate, string scope, out MessageData data)
         {
-            data = null;
             AutomationElement list = FindMessageList(root);
+            return TryGetLatestFromList(list, deduplicate, scope, out data);
+        }
+
+        internal bool TryGetLatestFromList(AutomationElement list, bool deduplicate, string scope, out MessageData data)
+        {
+            data = null;
             if (list == null) return false;
             AutomationElement item = GetLatestItem(list);
             if (item == null) return false;

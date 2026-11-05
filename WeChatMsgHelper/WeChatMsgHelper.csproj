@@ -18,7 +18,7 @@
     <OutputPath>bin\x64\Release\</OutputPath><DefineConstants>TRACE</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.Drawing"/><Reference Include="System.Speech"/><Reference Include="System.Windows.Forms"/>
+    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.Drawing"/><Reference Include="System.Runtime.Serialization"/><Reference Include="System.Speech"/><Reference Include="System.Windows.Forms"/><Reference Include="System.Xml"/>
     <Reference Include="UIAutomationClient"/><Reference Include="UIAutomationProvider"/><Reference Include="UIAutomationTypes"/><Reference Include="WindowsBase"/>
   </ItemGroup>
   <ItemGroup>
@@ -26,7 +26,7 @@
     <Compile Include="MainForm.cs"><SubType>Form</SubType></Compile><Compile Include="MessageExtractor.cs"/><Compile Include="MessageFilter.cs"/><Compile Include="MessageListener.cs"/>
     <Compile Include="MessageReviewManager.cs"/><Compile Include="SearchResultAnnouncer.cs"/><Compile Include="WeChatNavigator.cs"/>
     <Compile Include="Program.cs"/><Compile Include="SettingsForm.cs"><SubType>Form</SubType></Compile><Compile Include="SpeechQueue.cs"/><Compile Include="MessageSoundPlayer.cs"/>
-    <Compile Include="StartupManager.cs"/><Compile Include="TrayIcon.cs"/><Compile Include="Channels\ISpeechChannel.cs"/>
+    <Compile Include="StartupManager.cs"/><Compile Include="TrayIcon.cs"/><Compile Include="UpdateDialogs.cs"><SubType>Form</SubType></Compile><Compile Include="UpdateInstaller.cs"/><Compile Include="UpdateService.cs"/><Compile Include="Channels\ISpeechChannel.cs"/>
     <Compile Include="Channels\AutoSpeechChannel.cs"/><Compile Include="Channels\BaoyiChannel.cs"/><Compile Include="Channels\Sapi5Channel.cs"/><Compile Include="Channels\SpeechChannelFactory.cs"/><Compile Include="Channels\ZhengduChannel.cs"/>
     <Compile Include="Properties\AssemblyInfo.cs"/>
     <None Include="app.manifest"/>

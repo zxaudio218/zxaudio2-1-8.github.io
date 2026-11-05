@@ -5,6 +5,15 @@ using System.Windows.Automation;
 
 namespace WeChatMsgHelper
 {
+    internal sealed class DiscoveredWechatRoot
+    {
+        internal AutomationElement Root;
+        internal AutomationElement MessageList;
+        internal AutomationElement Input;
+        internal string Key;
+        internal int Handle;
+    }
+
     internal sealed class Discovery
     {
         private delegate bool EnumWindowsProc(IntPtr windowHandle, IntPtr parameter);
@@ -13,18 +22,38 @@ namespace WeChatMsgHelper
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
 
-        internal IList<AutomationElement> FindWechatRoots()
+        internal IList<DiscoveredWechatRoot> FindWechatRoots()
         {
-            List<AutomationElement> roots = new List<AutomationElement>();
+            List<DiscoveredWechatRoot> roots = new List<DiscoveredWechatRoot>();
             EnumWindows(delegate(IntPtr handle, IntPtr parameter)
             {
                 try
                 {
                     AutomationElement element = AutomationElement.FromHandle(handle);
                     string className = element.Current.ClassName;
-                    if ((className == "mmui::MainWindow" || className == "mmui::ChatSingleWindow") &&
-                        MessageExtractor.FindMessageList(element) != null)
-                        roots.Add(element);
+                    if (className == "mmui::MainWindow" || className == "mmui::ChatSingleWindow")
+                    {
+                        AutomationElement list = MessageExtractor.FindMessageList(element);
+                        if (list == null) return true;
+                        string runtimeId = MessageExtractor.GetElementRuntimeId(list);
+                        if (runtimeId.Length == 0) return true;
+                        AutomationElement input = null;
+                        try
+                        {
+                            input = element.FindFirst(TreeScope.Descendants,
+                                new PropertyCondition(AutomationElement.AutomationIdProperty, "chat_input_field"));
+                        }
+                        catch { }
+                        int nativeHandle = element.Current.NativeWindowHandle;
+                        roots.Add(new DiscoveredWechatRoot
+                        {
+                            Root = element,
+                            MessageList = list,
+                            Input = input,
+                            Handle = nativeHandle,
+                            Key = nativeHandle + ":" + runtimeId
+                        });
+                    }
                 }
                 catch (ElementNotAvailableException) { }
                 catch (InvalidOperationException) { }

@@ -10,8 +10,9 @@ namespace WeChatMsgHelper
         private const string MutexName = "Local\\WeChatMsgHelper-220021ea333fdbd86d9ef37f181002efb7b07f44";
 
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            if (UpdateInstaller.TryRunApplyMode(args)) return;
             InitializeCrashHandling();
             bool createdNew;
             using (Mutex mutex = new Mutex(true, MutexName, out createdNew))

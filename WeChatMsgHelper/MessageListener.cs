@@ -12,11 +12,14 @@ namespace WeChatMsgHelper
         {
             internal string Key;
             internal AutomationElement Root;
+            internal AutomationElement MessageList;
             internal AutomationElement Input;
             internal int Handle;
-            internal DateTime WarmupUntil;
             internal bool Ready;
             internal bool AnnounceWhenReady;
+            internal bool MessageListSubscribed;
+            internal bool InputSubscribed;
+            internal bool Removed;
         }
 
         [DllImport("user32.dll")]
@@ -27,19 +30,17 @@ namespace WeChatMsgHelper
         private readonly Action<MessageData> onConversationOpened;
         private readonly Action<Action> dispatch;
         private readonly System.Windows.Forms.Timer pollTimer;
-        private readonly System.Windows.Forms.Timer eventTimer;
         private readonly Dictionary<string, Binding> bindings = new Dictionary<string, Binding>(StringComparer.Ordinal);
+        private readonly object bindingLock = new object();
         private readonly AutomationPropertyChangedEventHandler propertyHandler;
         private readonly StructureChangedEventHandler structureHandler;
-        private int extractPending;
-        private bool suspended;
+        private int extractRunning;
+        private int extractAgain;
+        private volatile bool suspended;
+        private volatile bool disposed;
 
-        internal MessageListener(
-            MessageExtractor extractor,
-            AppConfig config,
-            Action<MessageData> onMessage,
-            Action<MessageData> onConversationOpened,
-            Action<Action> dispatch)
+        internal MessageListener(MessageExtractor extractor, AppConfig config, Action<MessageData> onMessage,
+            Action<MessageData> onConversationOpened, Action<Action> dispatch)
         {
             this.extractor = extractor;
             this.onMessage = onMessage;
@@ -49,46 +50,47 @@ namespace WeChatMsgHelper
             structureHandler = OnStructureChanged;
             pollTimer = new System.Windows.Forms.Timer();
             pollTimer.Interval = config.PollIntervalMs;
-            pollTimer.Tick += delegate { ExtractAndEmit(); };
-            eventTimer = new System.Windows.Forms.Timer();
-            eventTimer.Interval = 60;
-            eventTimer.Tick += delegate
-            {
-                eventTimer.Stop();
-                Interlocked.Exchange(ref extractPending, 0);
-                ExtractAndEmit();
-            };
+            pollTimer.Tick += delegate { QueueExtract(); };
             PollEnabled = config.PollFallback;
         }
 
         internal bool PollEnabled { get; set; }
-        internal bool IsBound { get { return bindings.Count > 0; } }
-        internal int BoundCount { get { return bindings.Count; } }
+        internal bool IsBound { get { lock (bindingLock) return bindings.Count > 0; } }
+        internal int BoundCount { get { lock (bindingLock) return bindings.Count; } }
 
-        internal void Synchronize(IList<AutomationElement> roots, bool announceOpenedChats)
+        internal void Synchronize(IList<DiscoveredWechatRoot> roots, bool announceOpenedChats)
         {
-            Dictionary<string, AutomationElement> candidates = new Dictionary<string, AutomationElement>(StringComparer.Ordinal);
-            foreach (AutomationElement root in roots)
-            {
-                string key = GetBindingKey(root);
-                if (key.Length > 0) candidates[key] = root;
-            }
+            Dictionary<string, DiscoveredWechatRoot> candidates = new Dictionary<string, DiscoveredWechatRoot>(StringComparer.Ordinal);
+            foreach (DiscoveredWechatRoot root in roots)
+                if (root != null && !string.IsNullOrEmpty(root.Key)) candidates[root.Key] = root;
 
             List<string> staleKeys = new List<string>();
-            foreach (KeyValuePair<string, Binding> pair in bindings)
-                if (!candidates.ContainsKey(pair.Key)) staleKeys.Add(pair.Key);
+            lock (bindingLock)
+                foreach (KeyValuePair<string, Binding> pair in bindings)
+                    if (!candidates.ContainsKey(pair.Key)) staleKeys.Add(pair.Key);
             foreach (string key in staleKeys) RemoveBinding(key);
 
-            foreach (KeyValuePair<string, AutomationElement> pair in candidates)
+            foreach (KeyValuePair<string, DiscoveredWechatRoot> pair in candidates)
             {
                 Binding existing;
-                if (bindings.TryGetValue(pair.Key, out existing))
+                lock (bindingLock) bindings.TryGetValue(pair.Key, out existing);
+                if (existing == null)
                 {
-                    existing.Root = pair.Value;
-                    if (!Discovery.IsAvailable(existing.Input)) existing.Input = FindInputField(pair.Value);
+                    AddBinding(pair.Value, announceOpenedChats);
                     continue;
                 }
-                AddBinding(pair.Key, pair.Value, announceOpenedChats);
+
+                existing.Root = pair.Value.Root;
+                existing.Handle = pair.Value.Handle;
+                if (!Discovery.IsAvailable(existing.MessageList))
+                {
+                    RemoveBinding(pair.Key);
+                    AddBinding(pair.Value, announceOpenedChats);
+                    continue;
+                }
+                if (Discovery.IsAvailable(pair.Value.Input) &&
+                    (!existing.InputSubscribed || !Discovery.IsAvailable(existing.Input) || !SameElement(existing.Input, pair.Value.Input)))
+                    ReplaceInput(existing, pair.Value.Input);
             }
 
             if (PollEnabled && IsBound) pollTimer.Start();
@@ -107,22 +109,24 @@ namespace WeChatMsgHelper
         {
             suspended = true;
             pollTimer.Stop();
-            eventTimer.Stop();
-            Interlocked.Exchange(ref extractPending, 0);
+            Interlocked.Exchange(ref extractAgain, 0);
         }
 
         internal void Resume()
         {
             suspended = false;
             if (IsBound && PollEnabled) pollTimer.Start();
+            QueueExtract();
         }
 
         internal void Stop()
         {
+            suspended = true;
             pollTimer.Stop();
-            eventTimer.Stop();
-            foreach (string key in new List<string>(bindings.Keys)) RemoveBinding(key);
-            Interlocked.Exchange(ref extractPending, 0);
+            List<string> keys;
+            lock (bindingLock) keys = new List<string>(bindings.Keys);
+            foreach (string key in keys) RemoveBinding(key);
+            Interlocked.Exchange(ref extractAgain, 0);
         }
 
         internal bool ReadLatest(out MessageData data)
@@ -133,7 +137,7 @@ namespace WeChatMsgHelper
             {
                 try
                 {
-                    if (extractor.TryGetLatest(binding.Root, false, out data) && data != null) return true;
+                    if (extractor.TryGetLatestFromList(binding.MessageList, false, binding.Key, out data) && data != null) return true;
                 }
                 catch { }
             }
@@ -142,175 +146,203 @@ namespace WeChatMsgHelper
 
         public void Dispose()
         {
+            if (disposed) return;
+            disposed = true;
             Stop();
             pollTimer.Dispose();
-            eventTimer.Dispose();
         }
 
-        private void AddBinding(string key, AutomationElement root, bool announce)
+        private void AddBinding(DiscoveredWechatRoot discovered, bool announce)
         {
+            if (discovered == null || discovered.MessageList == null) return;
+            Binding binding = new Binding
+            {
+                Key = discovered.Key,
+                Root = discovered.Root,
+                MessageList = discovered.MessageList,
+                Input = discovered.Input,
+                Handle = discovered.Handle,
+                AnnounceWhenReady = announce
+            };
             try
             {
-                Binding binding = new Binding();
-                binding.Key = key;
-                binding.Root = root;
-                binding.Input = FindInputField(root);
-                binding.Handle = root.Current.NativeWindowHandle;
-                Automation.AddAutomationPropertyChangedEventHandler(
-                    root,
-                    TreeScope.Descendants,
-                    propertyHandler,
-                    ValuePattern.ValueProperty,
-                    RangeValuePattern.ValueProperty);
-                Automation.AddStructureChangedEventHandler(root, TreeScope.Descendants, structureHandler);
-                binding.WarmupUntil = DateTime.UtcNow.AddMilliseconds(750);
-                binding.AnnounceWhenReady = announce;
-                bindings[key] = binding;
-                AppLog.Write("会话监听已加入：" + key);
+                Automation.AddStructureChangedEventHandler(binding.MessageList, TreeScope.Subtree, structureHandler);
+                binding.MessageListSubscribed = true;
+                SubscribeInput(binding);
+                lock (bindingLock) bindings[binding.Key] = binding;
+                AppLog.Write("会话监听已加入：" + binding.Key);
+                QueueExtract();
             }
-            catch (Exception ex) { AppLog.Write("订阅会话失败：" + ex.Message); }
+            catch (Exception ex)
+            {
+                Unsubscribe(binding);
+                AppLog.Write("订阅会话失败：" + ex.Message);
+            }
         }
 
         private void RemoveBinding(string key)
         {
             Binding binding;
-            if (!bindings.TryGetValue(key, out binding)) return;
-            try { Automation.RemoveAutomationPropertyChangedEventHandler(binding.Root, propertyHandler); }
-            catch { }
-            try { Automation.RemoveStructureChangedEventHandler(binding.Root, structureHandler); }
-            catch { }
-            bindings.Remove(key);
+            lock (bindingLock)
+            {
+                if (!bindings.TryGetValue(key, out binding)) return;
+                bindings.Remove(key);
+                binding.Removed = true;
+            }
+            Unsubscribe(binding);
             AppLog.Write("会话监听已移除：" + key);
+        }
+
+        private void SubscribeInput(Binding binding)
+        {
+            if (!Discovery.IsAvailable(binding.Input)) return;
+            Automation.AddAutomationPropertyChangedEventHandler(binding.Input, TreeScope.Element, propertyHandler,
+                ValuePattern.ValueProperty, AutomationElement.NameProperty);
+            binding.InputSubscribed = true;
+        }
+
+        private void ReplaceInput(Binding binding, AutomationElement input)
+        {
+            if (binding.InputSubscribed)
+            {
+                try { Automation.RemoveAutomationPropertyChangedEventHandler(binding.Input, propertyHandler); }
+                catch { }
+            }
+            binding.InputSubscribed = false;
+            binding.Input = input;
+            try { SubscribeInput(binding); }
+            catch (Exception ex) { AppLog.Write("重新订阅输入框失败：" + ex.Message); }
+        }
+
+        private void Unsubscribe(Binding binding)
+        {
+            if (binding == null) return;
+            if (binding.InputSubscribed)
+            {
+                try { Automation.RemoveAutomationPropertyChangedEventHandler(binding.Input, propertyHandler); }
+                catch { }
+                binding.InputSubscribed = false;
+            }
+            if (binding.MessageListSubscribed)
+            {
+                try { Automation.RemoveStructureChangedEventHandler(binding.MessageList, structureHandler); }
+                catch { }
+                binding.MessageListSubscribed = false;
+            }
         }
 
         private IEnumerable<Binding> OrderedForManualRead(int foreground)
         {
-            foreach (Binding binding in bindings.Values) if (binding.Handle == foreground) yield return binding;
-            foreach (Binding binding in bindings.Values) if (binding.Handle != foreground) yield return binding;
+            List<Binding> snapshot;
+            lock (bindingLock) snapshot = new List<Binding>(bindings.Values);
+            foreach (Binding binding in snapshot) if (!binding.Removed && binding.Handle == foreground) yield return binding;
+            foreach (Binding binding in snapshot) if (!binding.Removed && binding.Handle != foreground) yield return binding;
         }
 
         private void OnPropertyChanged(object sender, AutomationPropertyChangedEventArgs args)
         {
-            if (suspended) return;
-            AutomationElement element = sender as AutomationElement;
-            if (element == null) return;
-            AutomationElement input = GetInputField(element);
-            if (input != null)
-            {
-                NoteInputText(input);
-                return;
-            }
-            if (!IsInsideMessageList(element)) return;
-            ScheduleExtract();
+            if (suspended || disposed) return;
+            AutomationElement input = sender as AutomationElement;
+            if (input != null) NoteInputText(input);
         }
 
         private void OnStructureChanged(object sender, StructureChangedEventArgs args)
         {
-            if (suspended) return;
-            AutomationElement element = sender as AutomationElement;
-            if (element == null || !IsInsideMessageList(element)) return;
-            ScheduleExtract();
+            if (!suspended && !disposed) QueueExtract();
         }
 
-        private static bool IsInsideMessageList(AutomationElement element)
+        private void QueueExtract()
+        {
+            if (suspended || disposed) return;
+            if (Interlocked.CompareExchange(ref extractRunning, 1, 0) != 0)
+            {
+                Interlocked.Exchange(ref extractAgain, 1);
+                return;
+            }
+            Thread worker = new Thread(ExtractWorker);
+            worker.IsBackground = true;
+            worker.Name = "WeChatMsgHelper Message Extractor";
+            worker.SetApartmentState(ApartmentState.MTA);
+            worker.Start();
+        }
+
+        private void ExtractWorker()
         {
             try
             {
-                TreeWalker walker = TreeWalker.RawViewWalker;
-                AutomationElement current = element;
-                for (int depth = 0; depth < 12 && current != null; depth++)
+                do
                 {
-                    if (current.Current.AutomationId == "chat_message_list") return true;
-                    current = walker.GetParent(current);
+                    Interlocked.Exchange(ref extractAgain, 0);
+                    if (suspended || disposed) break;
+                    List<Binding> snapshot;
+                    lock (bindingLock) snapshot = new List<Binding>(bindings.Values);
+                    ExtractAndEmit(snapshot);
                 }
+                while (Interlocked.Exchange(ref extractAgain, 0) != 0 && !suspended && !disposed);
             }
-            catch { }
-            return false;
-        }
-
-        private static AutomationElement GetInputField(AutomationElement element)
-        {
-            try
+            finally
             {
-                TreeWalker walker = TreeWalker.RawViewWalker;
-                AutomationElement current = element;
-                for (int depth = 0; depth < 5 && current != null; depth++)
-                {
-                    if (current.Current.AutomationId == "chat_input_field") return current;
-                    current = walker.GetParent(current);
-                }
+                Interlocked.Exchange(ref extractRunning, 0);
+                if (Interlocked.Exchange(ref extractAgain, 0) != 0 && !suspended && !disposed) QueueExtract();
             }
-            catch { }
-            return null;
         }
 
-        private void ScheduleExtract()
+        private void ExtractAndEmit(IList<Binding> snapshot)
         {
-            if (suspended) return;
-            if (Interlocked.Exchange(ref extractPending, 1) != 0) return;
-            dispatch(delegate
+            foreach (Binding binding in snapshot)
             {
-                if (suspended) { Interlocked.Exchange(ref extractPending, 0); return; }
-                eventTimer.Stop();
-                eventTimer.Start();
-            });
-        }
-
-        private void ExtractAndEmit()
-        {
-            if (suspended) return;
-            foreach (Binding binding in new List<Binding>(bindings.Values))
-            {
+                if (binding.Removed || suspended || disposed) continue;
                 try
                 {
                     SampleInputText(binding);
                     if (!binding.Ready)
                     {
-                        if (DateTime.UtcNow < binding.WarmupUntil) continue;
-                        binding.Ready = extractor.Prime(binding.Root, binding.Key);
+                        binding.Ready = extractor.PrimeList(binding.MessageList, binding.Key);
                         if (!binding.Ready) continue;
                         if (binding.AnnounceWhenReady)
                         {
                             binding.AnnounceWhenReady = false;
                             MessageData latest;
-                            if (extractor.TryGetLatest(binding.Root, false, out latest) && latest != null) onConversationOpened(latest);
+                            if (extractor.TryGetLatestFromList(binding.MessageList, false, binding.Key, out latest) && latest != null)
+                                DispatchConversationOpened(binding, latest);
                         }
                         continue;
                     }
-                    foreach (MessageData data in extractor.GetNewMessages(binding.Root, binding.Key)) onMessage(data);
+                    foreach (MessageData message in extractor.GetNewMessagesFromList(binding.MessageList, binding.Key))
+                        DispatchMessage(binding, message);
                 }
-                catch (ElementNotAvailableException ex)
-                {
-                    AppLog.Write("微信消息列表元素失效，准备重绑：" + ex.Message);
-                    Rebind(binding, false);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    AppLog.Write("微信消息列表访问失败，准备重绑：" + ex.Message);
-                    Rebind(binding, false);
-                }
+                catch (ElementNotAvailableException ex) { Invalidate(binding, ex.Message); }
+                catch (InvalidOperationException ex) { Invalidate(binding, ex.Message); }
                 catch (Exception ex) { AppLog.Write("提取会话消息失败：" + ex.Message); }
             }
         }
 
-        private void SampleInputText(Binding binding)
+        private void DispatchMessage(Binding binding, MessageData message)
         {
-            try
+            dispatch(delegate
             {
-                if (!Discovery.IsAvailable(binding.Input)) binding.Input = FindInputField(binding.Root);
-                if (binding.Input != null) NoteInputText(binding.Input);
-            }
-            catch { binding.Input = null; }
+                if (!binding.Removed && !suspended && !disposed) onMessage(message);
+            });
         }
 
-        private static AutomationElement FindInputField(AutomationElement root)
+        private void DispatchConversationOpened(Binding binding, MessageData message)
         {
-            try
+            dispatch(delegate
             {
-                return root.FindFirst(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, "chat_input_field"));
-            }
-            catch { return null; }
+                if (!binding.Removed && !suspended && !disposed) onConversationOpened(message);
+            });
+        }
+
+        private void Invalidate(Binding binding, string reason)
+        {
+            if (binding.Removed) return;
+            AppLog.Write("微信消息列表元素失效，准备重绑：" + reason);
+            dispatch(delegate { RemoveBinding(binding.Key); });
+        }
+
+        private void SampleInputText(Binding binding)
+        {
+            if (Discovery.IsAvailable(binding.Input)) NoteInputText(binding.Input);
         }
 
         private void NoteInputText(AutomationElement input)
@@ -329,32 +361,12 @@ namespace WeChatMsgHelper
             catch { }
         }
 
-        private void Rebind(Binding binding, bool announce)
+        private static bool SameElement(AutomationElement left, AutomationElement right)
         {
-            if (binding == null || !bindings.ContainsKey(binding.Key)) return;
-            string key = binding.Key;
-            AutomationElement root = null;
-            try
-            {
-                AutomationElement candidate = AutomationElement.FromHandle(new IntPtr(binding.Handle));
-                if (GetBindingKey(candidate) == key) root = candidate;
-            }
-            catch { }
-            RemoveBinding(key);
-            if (root != null) AddBinding(key, root, announce);
-        }
-
-        private static string GetBindingKey(AutomationElement root)
-        {
-            try
-            {
-                AutomationElement list = MessageExtractor.FindMessageList(root);
-                if (list == null) return string.Empty;
-                string listRuntimeId = MessageExtractor.GetElementRuntimeId(list);
-                if (listRuntimeId.Length == 0) return string.Empty;
-                return root.Current.NativeWindowHandle + ":" + listRuntimeId;
-            }
-            catch { return string.Empty; }
+            if (left == null || right == null) return false;
+            string leftId = MessageExtractor.GetElementRuntimeId(left);
+            string rightId = MessageExtractor.GetElementRuntimeId(right);
+            return leftId.Length > 0 && string.Equals(leftId, rightId, StringComparison.Ordinal);
         }
     }
 }
