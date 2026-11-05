@@ -426,9 +426,10 @@ namespace WeChatMsgHelper
                 changed = true;
             }
             if (config.ToggleNotifyHotkey.Equals("Ctrl+Alt+N", StringComparison.OrdinalIgnoreCase) ||
-                config.ToggleNotifyHotkey.Equals("Ctrl+Shift+Alt+N", StringComparison.OrdinalIgnoreCase))
+                config.ToggleNotifyHotkey.Equals("Ctrl+Shift+Alt+N", StringComparison.OrdinalIgnoreCase) ||
+                config.ToggleNotifyHotkey.Equals("Ctrl+Shift+F11", StringComparison.OrdinalIgnoreCase))
             {
-                config.ToggleNotifyHotkey = "Ctrl+Shift+F11";
+                config.ToggleNotifyHotkey = "Alt+Shift+F8";
                 changed = true;
             }
             if (changed)
