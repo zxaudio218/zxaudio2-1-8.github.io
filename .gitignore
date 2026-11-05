@@ -1,0 +1,17 @@
+# Visual Studio and MSBuild outputs
+.vs/
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Local runtime data
+config.ini
+log.txt
+*.log
+
+# OS and editor files
+Thumbs.db
+.DS_Store
+*.tmp
+*.bak

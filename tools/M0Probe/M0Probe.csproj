@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)'==''">Debug</Configuration><Platform Condition="'$(Platform)'==''">x64</Platform>
+    <ProjectGuid>{CE58244A-CAC2-48A5-A531-12A2780D806E}</ProjectGuid><OutputType>Exe</OutputType>
+    <RootNamespace>M0Probe</RootNamespace><AssemblyName>M0Probe</AssemblyName><TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <StartupObject>M0Probe.Program</StartupObject><PlatformTarget>x64</PlatformTarget><Prefer32Bit>false</Prefer32Bit><WarningLevel>4</WarningLevel><CodePage>65001</CodePage>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <DebugSymbols>true</DebugSymbols><DebugType>full</DebugType><Optimize>false</Optimize><OutputPath>bin\x64\Debug\</OutputPath><DefineConstants>DEBUG;TRACE</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <DebugSymbols>false</DebugSymbols><DebugType>none</DebugType><Optimize>true</Optimize><OutputPath>bin\x64\Release\</OutputPath><DefineConstants>TRACE</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.Drawing"/><Reference Include="System.Windows.Forms"/>
+    <Reference Include="UIAutomationClient"/><Reference Include="UIAutomationProvider"/><Reference Include="UIAutomationTypes"/>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="AutomationProbe.cs"/><Compile Include="BaoyiProbe.cs"/><Compile Include="NativeMethods.cs"/><Compile Include="Program.cs"/>
+    <Compile Include="Properties\AssemblyInfo.cs"/><Compile Include="WindowProbe.cs"/><Compile Include="ZhengduProbe.cs"/>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
+</Project>

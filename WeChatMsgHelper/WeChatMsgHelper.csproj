@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)'==''">Debug</Configuration>
+    <Platform Condition="'$(Platform)'==''">x64</Platform>
+    <ProjectGuid>{A92AC33A-E02B-4CEB-8E05-C9295F267E7E}</ProjectGuid>
+    <OutputType>WinExe</OutputType><RootNamespace>WeChatMsgHelper</RootNamespace><AssemblyName>WeChatMsgHelper</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion><FileAlignment>512</FileAlignment>
+    <ApplicationManifest>app.manifest</ApplicationManifest><StartupObject>WeChatMsgHelper.Program</StartupObject>
+    <PlatformTarget>x64</PlatformTarget><Prefer32Bit>false</Prefer32Bit><WarningLevel>4</WarningLevel><CodePage>65001</CodePage>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <DebugSymbols>true</DebugSymbols><DebugType>full</DebugType><Optimize>false</Optimize>
+    <OutputPath>bin\x64\Debug\</OutputPath><DefineConstants>DEBUG;TRACE</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <DebugSymbols>false</DebugSymbols><DebugType>none</DebugType><Optimize>true</Optimize>
+    <OutputPath>bin\x64\Release\</OutputPath><DefineConstants>TRACE</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.Drawing"/><Reference Include="System.Speech"/><Reference Include="System.Windows.Forms"/>
+    <Reference Include="UIAutomationClient"/><Reference Include="UIAutomationProvider"/><Reference Include="UIAutomationTypes"/><Reference Include="WindowsBase"/>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="AppDataPaths.cs"/><Compile Include="AppLog.cs"/><Compile Include="Config.cs"/><Compile Include="Discovery.cs"/><Compile Include="HotkeyManager.cs"/>
+    <Compile Include="MainForm.cs"><SubType>Form</SubType></Compile><Compile Include="MessageExtractor.cs"/><Compile Include="MessageFilter.cs"/><Compile Include="MessageListener.cs"/>
+    <Compile Include="MessageReviewManager.cs"/><Compile Include="SearchResultAnnouncer.cs"/><Compile Include="WeChatNavigator.cs"/>
+    <Compile Include="Program.cs"/><Compile Include="SettingsForm.cs"><SubType>Form</SubType></Compile><Compile Include="SpeechQueue.cs"/><Compile Include="MessageSoundPlayer.cs"/>
+    <Compile Include="StartupManager.cs"/><Compile Include="TrayIcon.cs"/><Compile Include="Channels\ISpeechChannel.cs"/>
+    <Compile Include="Channels\AutoSpeechChannel.cs"/><Compile Include="Channels\BaoyiChannel.cs"/><Compile Include="Channels\Sapi5Channel.cs"/><Compile Include="Channels\SpeechChannelFactory.cs"/><Compile Include="Channels\ZhengduChannel.cs"/>
+    <Compile Include="Properties\AssemblyInfo.cs"/>
+    <None Include="app.manifest"/>
+    <EmbeddedResource Include="Resources\SentMessage.mp3"><LogicalName>WeChatMsgHelper.Audio.SentMessage.mp3</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="Resources\SIMToolkitSMS.mp3"><LogicalName>WeChatMsgHelper.Audio.SIMToolkitSMS.mp3</LogicalName></EmbeddedResource>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
+</Project>
