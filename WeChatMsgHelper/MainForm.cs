@@ -1,511 +1,182 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Drawing;
+using System.Globalization;
 using System.IO;
-using System.Media;
-using System.Threading;
-using System.Windows.Automation;
-using System.Windows.Forms;
-using WeChatMsgHelper.Channels;
+using System.Text;
 
 namespace WeChatMsgHelper
 {
-    internal sealed class MainForm : Form
+    internal static class SpeechChannelNames
     {
-        private const int WmHotkey = 0x0312;
-        private readonly Discovery discovery = new Discovery();
-        private readonly MessageSoundPlayer messageSounds = new MessageSoundPlayer();
-        private readonly WeChatNavigator navigator = new WeChatNavigator();
-        private readonly System.Windows.Forms.Timer discoveryTimer = new System.Windows.Forms.Timer();
-        private readonly System.Windows.Forms.Timer contextTimer = new System.Windows.Forms.Timer();
-        private readonly System.Windows.Forms.Timer hotkeyFallbackTimer = new System.Windows.Forms.Timer();
-        private AppConfig config;
-        private MessageExtractor extractor;
-        private MessageListener listener;
-        private SpeechQueue speechQueue;
-        private HotkeyManager hotkeys;
-        private TrayIcon tray;
-        private MessageReviewManager reviewManager;
-        private SearchResultAnnouncer searchAnnouncer;
-        private DateTime suppressUntil;
-        private string statusText = "正在启动...";
-        private bool exiting;
-        private bool settingsOpen;
-        private int discoveryPending;
+        internal const string Auto = "auto";
+        internal const string ZhengduIndependent = "zhengdu-independent";
+        internal const string ZhengduScreenReader = "zhengdu-screen-reader";
+        internal const string Baoyi = "baoyi-independent";
+        internal const string BaoyiIndependent = "baoyi-independent";
+        internal const string BaoyiScreenReader = "baoyi-screen-reader";
+        internal const string Sapi5 = "sapi5";
 
-        public MainForm()
+        internal static string Normalize(string value)
         {
-            AutoScaleMode = AutoScaleMode.Dpi;
-            ClientSize = new Size(1, 1);
-            FormBorderStyle = FormBorderStyle.FixedToolWindow;
-            Opacity = 0D;
-            ShowIcon = false;
-            ShowInTaskbar = false;
-            StartPosition = FormStartPosition.Manual;
-            Location = new Point(-32000, -32000);
-            Text = "WeChatMsgHelper";
-            CreateHandle();
-
-            IList<string> migrationWarnings = AppDataPaths.Initialize(AppDomain.CurrentDomain.BaseDirectory);
-            AppLog.Initialize(AppDataPaths.DataDirectory);
-            foreach (string warning in migrationWarnings) AppLog.Write(warning);
-            config = LoadConfig();
-            MigrateLegacyHotkeys();
-            tray = new TrayIcon(ToggleListening, SetMode, SetSpeechChannel, ReadLatest, TestSpeech, OpenSettings, ExitApplication);
-            hotkeys = new HotkeyManager(Handle);
-            hotkeys.RegisterAll(config, ReportHotkeyFailure);
-            CreateListener();
-            RebuildSpeech(false);
-            searchAnnouncer = new SearchResultAnnouncer(Dispatch, SpeakText);
-            ApplySavedStartup();
-
-            discoveryTimer.Interval = 500;
-            discoveryTimer.Tick += delegate { BeginBindWechat(); };
-            discoveryTimer.Start();
-            contextTimer.Interval = 250;
-            contextTimer.Tick += delegate { SafeUpdateContextHotkeys(); };
-            contextTimer.Start();
-            hotkeyFallbackTimer.Interval = 40;
-            hotkeyFallbackTimer.Tick += delegate { PollHotkeyFallback(); };
-            hotkeyFallbackTimer.Start();
-            BeginBindWechat();
-            UpdateTray();
-            WarnAboutNvda();
+            if (string.Equals(value, Auto, StringComparison.OrdinalIgnoreCase)) return Auto;
+            if (string.Equals(value, ZhengduScreenReader, StringComparison.OrdinalIgnoreCase)) return ZhengduScreenReader;
+            if (string.Equals(value, "baoyi", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, BaoyiIndependent, StringComparison.OrdinalIgnoreCase)) return BaoyiIndependent;
+            if (string.Equals(value, BaoyiScreenReader, StringComparison.OrdinalIgnoreCase)) return BaoyiScreenReader;
+            if (string.Equals(value, Sapi5, StringComparison.OrdinalIgnoreCase)) return Sapi5;
+            return ZhengduIndependent;
         }
+    }
 
-        protected override void SetVisibleCore(bool value)
-        {
-            base.SetVisibleCore(false);
-        }
+    internal enum NotificationMode
+    {
+        Off = 0,
+        SoundOnly = 1,
+        SpeechOnly = 2,
+        SpeechAndSound = 3
+    }
 
-        protected override void WndProc(ref Message message)
-        {
-            if (message.Msg == WmHotkey)
-                HandleHotkey(message.WParam.ToInt32());
-            base.WndProc(ref message);
-        }
+    internal sealed class AppConfig
+    {
+        public string FilePath;
+        public NotificationMode NotificationMode = NotificationMode.SpeechAndSound;
+        public bool ListeningEnabled = true;
+        public bool SoundEnabled = true;
+        public bool PollFallback = true;
+        public int PollIntervalMs = 500;
+        public bool ReadNonTextMessages = true;
+        public bool IgnoreSystemMessages;
+        public bool AutoStart;
+        public string SpeechChannel = SpeechChannelNames.ZhengduIndependent;
+        public string ReadLatestHotkey = "Ctrl+Alt+F11";
+        public string ToggleNotifyHotkey = "Ctrl+Alt+Shift+F11";
+        public string ToggleModeHotkey = "Ctrl+Alt+P";
+        public string OpenSettingsHotkey = "Ctrl+Alt+S";
+        public bool ZhengduKeyDownInterrupt;
+        public string BaoyiChannelName = "WeChatMsg";
+        public string Sapi5Voice = string.Empty;
+        public int Sapi5Rate;
+        public int Sapi5Volume = 100;
 
-        protected override void OnFormClosing(FormClosingEventArgs e)
+        public static AppConfig Load(string path)
         {
-            if (!exiting) exiting = true;
-            discoveryTimer.Stop();
-            contextTimer.Stop();
-            hotkeyFallbackTimer.Stop();
-            // Speak before UIA and worker cleanup so the exit announcement is immediate.
-            if (speechQueue != null) speechQueue.ShutdownWithAnnouncement();
-            if (listener != null) listener.Dispose();
-            if (reviewManager != null) reviewManager.Dispose();
-            if (searchAnnouncer != null) searchAnnouncer.Dispose();
-            if (messageSounds != null) messageSounds.Dispose();
-            if (hotkeys != null) hotkeys.Dispose();
-            if (tray != null) tray.Dispose();
-            discoveryTimer.Dispose();
-            contextTimer.Dispose();
-            hotkeyFallbackTimer.Dispose();
-            base.OnFormClosing(e);
-        }
-
-        protected override void OnFormClosed(FormClosedEventArgs e)
-        {
-            base.OnFormClosed(e);
-            // A hidden tray host can leave the WinForms message loop alive on some
-            // Win10/Win11 builds. Force the process to terminate after cleanup.
-            Environment.Exit(0);
-        }
-
-        private void HandleHotkey(int id)
-        {
-            switch (id)
+            AppConfig config = new AppConfig();
+            config.FilePath = path;
+            if (!File.Exists(path))
             {
-                case HotkeyManager.ReadLatestId: ReadLatest(); break;
-                case HotkeyManager.ToggleNotifyId: ToggleListening(); break;
-                case HotkeyManager.ToggleModeId: CycleMode(); break;
-                case HotkeyManager.OpenSettingsId: OpenSettings(); break;
-                case HotkeyManager.TestSpeechId: TestSpeech(); break;
-                case HotkeyManager.FocusOfficialAccountsId: FocusOfficialAccounts(); break;
-                case HotkeyManager.FocusContactsId: FocusContacts(); break;
-                case HotkeyManager.FocusVoipId: FocusVoip(); break;
-                case HotkeyManager.ReviewPreviousId: reviewManager.ReadPrevious(); break;
-                case HotkeyManager.ReviewNextId: reviewManager.ReadNext(); break;
-                case HotkeyManager.ReviewFirstId: reviewManager.ReadFirst(); break;
-                case HotkeyManager.ReviewLastId: reviewManager.ReadLast(); break;
-                case HotkeyManager.NvdaModeId: CycleNvdaMode(); break;
+                config.Save();
+                return config;
             }
+
+            Dictionary<string, string> values = Parse(path);
+            config.NotificationMode = (NotificationMode)Clamp(GetInt(values, "General.NotificationMode", (int)config.NotificationMode), 0, 3);
+            config.ListeningEnabled = GetBool(values, "General.ListeningEnabled", config.ListeningEnabled);
+            config.SoundEnabled = GetBool(values, "General.SoundEnabled", config.SoundEnabled);
+            config.PollFallback = GetBool(values, "General.PollFallback", config.PollFallback);
+            config.PollIntervalMs = Clamp(GetInt(values, "General.PollIntervalMs", config.PollIntervalMs), 200, 5000);
+            config.ReadNonTextMessages = GetBool(values, "General.ReadNonTextMessages", config.ReadNonTextMessages);
+            config.IgnoreSystemMessages = GetBool(values, "General.IgnoreSystemMessages", config.IgnoreSystemMessages);
+            config.AutoStart = GetBool(values, "General.AutoStart", config.AutoStart);
+            config.SpeechChannel = SpeechChannelNames.Normalize(Get(values, "General.SpeechChannel", config.SpeechChannel));
+            config.ReadLatestHotkey = Get(values, "Hotkeys.ReadLatest", config.ReadLatestHotkey);
+            config.ToggleNotifyHotkey = Get(values, "Hotkeys.ToggleNotify", config.ToggleNotifyHotkey);
+            config.ToggleModeHotkey = Get(values, "Hotkeys.ToggleMode", config.ToggleModeHotkey);
+            config.OpenSettingsHotkey = Get(values, "Hotkeys.OpenSettings", config.OpenSettingsHotkey);
+            config.ZhengduKeyDownInterrupt = GetBool(values, "Zhengdu.KeyDownInterrupt", config.ZhengduKeyDownInterrupt);
+            config.BaoyiChannelName = NormalizeBaoyiChannelName(Get(values, "Baoyi.ChannelName", config.BaoyiChannelName));
+            config.Sapi5Voice = Get(values, "Sapi5.Voice", config.Sapi5Voice);
+            config.Sapi5Rate = Clamp(GetInt(values, "Sapi5.Rate", config.Sapi5Rate), -10, 10);
+            config.Sapi5Volume = Clamp(GetInt(values, "Sapi5.Volume", config.Sapi5Volume), 0, 100);
+            config.Save();
+            return config;
         }
 
-        private void PollHotkeyFallback()
+        public void Save()
         {
-            if (settingsOpen || exiting || hotkeys == null) return;
-            foreach (int id in hotkeys.PollFallback()) HandleHotkey(id);
-        }
-
-        private AppConfig LoadConfig()
-        {
-            string path = AppDataPaths.ConfigPath;
-            try { return AppConfig.Load(path); }
-            catch (Exception ex)
+            string[] lines =
             {
-                AppLog.Write("加载配置失败：" + ex.Message);
-                AppConfig fallback = new AppConfig();
-                fallback.FilePath = path;
-                return fallback;
-            }
+                "[General]",
+                "NotificationMode=" + ((int)NotificationMode).ToString(CultureInfo.InvariantCulture),
+                "ListeningEnabled=" + Bool(ListeningEnabled),
+                "SoundEnabled=" + Bool(SoundEnabled),
+                "PollFallback=" + Bool(PollFallback),
+                "PollIntervalMs=" + PollIntervalMs.ToString(CultureInfo.InvariantCulture),
+                "ReadNonTextMessages=" + Bool(ReadNonTextMessages),
+                "IgnoreSystemMessages=" + Bool(IgnoreSystemMessages),
+                "AutoStart=" + Bool(AutoStart),
+                "SpeechChannel=" + SpeechChannelNames.Normalize(SpeechChannel),
+                string.Empty,
+                "[Hotkeys]",
+                "ReadLatest=" + ReadLatestHotkey,
+                "ToggleNotify=" + ToggleNotifyHotkey,
+                "ToggleMode=" + ToggleModeHotkey,
+                "OpenSettings=" + OpenSettingsHotkey,
+                string.Empty,
+                "[Zhengdu]",
+                "KeyDownInterrupt=" + Bool(ZhengduKeyDownInterrupt),
+                string.Empty,
+                "[Baoyi]",
+                "ChannelName=" + NormalizeBaoyiChannelName(BaoyiChannelName),
+                string.Empty,
+                "[Sapi5]",
+                "Voice=" + (Sapi5Voice ?? string.Empty),
+                "Rate=" + Sapi5Rate.ToString(CultureInfo.InvariantCulture),
+                "Volume=" + Sapi5Volume.ToString(CultureInfo.InvariantCulture)
+            };
+            File.WriteAllLines(FilePath, lines, new UTF8Encoding(false));
         }
 
-        private void CreateListener()
+        private static Dictionary<string, string> Parse(string path)
         {
-            if (listener != null) listener.Dispose();
-            if (reviewManager != null) reviewManager.Dispose();
-            extractor = new MessageExtractor(config.ReadNonTextMessages);
-            listener = new MessageListener(extractor, config, ProcessIncomingMessage, ProcessConversationOpened, Dispatch);
-            reviewManager = new MessageReviewManager(navigator, extractor, SpeakText, SuppressAutomaticNotifications);
-        }
-
-        private void BeginBindWechat()
-        {
-            if (exiting || settingsOpen || Interlocked.Exchange(ref discoveryPending, 1) != 0) return;
-            Thread worker = new Thread(new ThreadStart(delegate
+            Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string section = string.Empty;
+            foreach (string rawLine in File.ReadAllLines(path, Encoding.UTF8))
             {
-                IList<AutomationElement> roots = null;
-                Exception error = null;
-                try { roots = discovery.FindWechatRoots(); }
-                catch (Exception ex) { error = ex; }
-                Dispatch(delegate
+                string line = rawLine.Trim();
+                if (line.Length == 0 || line.StartsWith(";", StringComparison.Ordinal) || line.StartsWith("#", StringComparison.Ordinal)) continue;
+                if (line.StartsWith("[", StringComparison.Ordinal) && line.EndsWith("]", StringComparison.Ordinal))
                 {
-                    Interlocked.Exchange(ref discoveryPending, 0);
-                    if (exiting || settingsOpen) return;
-                    if (error != null)
-                    {
-                        statusText = "微信 UIA 暂时无响应";
-                        AppLog.Write("微信 UIA 发现失败：" + error.GetType().Name + "，" + error.Message);
-                        UpdateTray();
-                        return;
-                    }
-                    ApplyWechatRoots(roots ?? new List<AutomationElement>());
-                });
-            }));
-            worker.IsBackground = true;
-            worker.Name = "WeChatMsgHelper UIA Discovery";
-            worker.SetApartmentState(ApartmentState.MTA);
-            worker.Start();
-        }
-
-        private void ApplyWechatRoots(IList<AutomationElement> roots)
-        {
-            if (roots.Count == 0)
-            {
-                try { listener.Synchronize(roots, true); }
-                catch (Exception ex) { AppLog.Write("清理微信 UIA 绑定失败：" + ex.Message); }
-                statusText = "等待打开具体微信聊天";
-                UpdateTray();
-                return;
-            }
-            try
-            {
-                listener.Synchronize(roots, true);
-                statusText = "正在监听 " + listener.BoundCount + " 个会话";
-                UpdateTray();
-            }
-            catch (Exception ex)
-            {
-                statusText = "微信 UIA 绑定失败";
-                AppLog.Write("绑定微信失败：" + ex.Message);
-                UpdateTray();
-            }
-        }
-
-        private void ProcessIncomingMessage(MessageData data)
-        {
-            AppLog.Write("捕获新消息，长度=" + data.Text.Length + "，方向=" + data.Direction + "，模式=" + (int)config.NotificationMode);
-            if (ShouldIgnoreSystemMessage(data)) return;
-            NotifyMessage(data, true, true);
-        }
-
-        private void ProcessConversationOpened(MessageData data)
-        {
-            AppLog.Write("打开会话，自动朗读最后一条，长度=" + data.Text.Length);
-            if (ShouldIgnoreSystemMessage(data)) return;
-            NotifyMessage(data, false, true);
-        }
-
-        private void NotifyMessage(MessageData data, bool respectSuppression, bool playMessageSound)
-        {
-            if (!config.ListeningEnabled || (respectSuppression && DateTime.Now < suppressUntil) || config.NotificationMode == NotificationMode.Off) return;
-            if (config.SoundEnabled && (config.NotificationMode == NotificationMode.SoundOnly || config.NotificationMode == NotificationMode.SpeechAndSound))
-            {
-                if (playMessageSound) messageSounds.Play(data.Direction);
-                else SystemSounds.Asterisk.Play();
-            }
-            if (config.NotificationMode == NotificationMode.SpeechOnly || config.NotificationMode == NotificationMode.SpeechAndSound)
-                speechQueue.Enqueue(data.Text);
-        }
-
-        private void ReadLatest()
-        {
-            suppressUntil = DateTime.Now.AddSeconds(2);
-            if (!listener.IsBound) BeginBindWechat();
-            MessageData data;
-            if (!listener.ReadLatest(out data) || data == null)
-            {
-                ShowWarning("未找到当前聊天的最新消息。请先打开一个具体聊天并开启读屏优化模式。");
-                return;
-            }
-            speechQueue.Enqueue(data.Text);
-        }
-
-        private void TestSpeech()
-        {
-            speechQueue.Enqueue("微信消息助手语音通道测试");
-            tray.ShowMessage("语音通道", "已提交测试文本，请留意是否听到朗读。", ToolTipIcon.Info);
-        }
-
-        private void FocusOfficialAccounts()
-        {
-            SpeakText(navigator.FocusOfficialAccountList() ? "公众号列表" : "未找到公众号列表");
-        }
-
-        private void FocusContacts()
-        {
-            SpeakText(navigator.FocusContactList() ? "通讯录列表" : "未找到通讯录列表");
-        }
-
-        private void FocusVoip()
-        {
-            SpeakText(navigator.FocusVoipTrayWindow() ? "音视频接听窗口" : "未找到音视频接听窗口");
-        }
-
-        private void CycleNvdaMode()
-        {
-            NotificationMode next;
-            if (config.NotificationMode == NotificationMode.Off) next = NotificationMode.SoundOnly;
-            else if (config.NotificationMode == NotificationMode.SoundOnly) next = NotificationMode.SpeechAndSound;
-            else next = NotificationMode.Off;
-            config.NotificationMode = next;
-            SaveConfig();
-            UpdateTray();
-            SpeakText(ModeText(next));
-        }
-
-        private void SpeakText(string text)
-        {
-            if (speechQueue != null) speechQueue.Enqueue(text);
-        }
-
-        private void SuppressAutomaticNotifications()
-        {
-            suppressUntil = DateTime.Now.AddSeconds(2);
-        }
-
-        private void SafeUpdateContextHotkeys()
-        {
-            if (settingsOpen || exiting) return;
-            try { hotkeys.UpdateWeChatContext(navigator.IsWechatForeground(), navigator.IsMessageInputFocused(), ReportHotkeyFailure); }
-            catch (Exception ex) { AppLog.Write("微信快捷键上下文探测失败：" + ex.Message); }
-        }
-
-        private void ToggleListening()
-        {
-            config.ListeningEnabled = !config.ListeningEnabled;
-            SaveConfig();
-            UpdateTray();
-            tray.ShowMessage("微信消息助手", config.ListeningEnabled ? "已开始监听新消息。" : "已停止监听新消息。", ToolTipIcon.Info);
-        }
-
-        private void CycleMode()
-        {
-            int next = ((int)config.NotificationMode + 1) % 4;
-            SetMode((NotificationMode)next);
-        }
-
-        private void SetMode(NotificationMode mode)
-        {
-            config.NotificationMode = mode;
-            SaveConfig();
-            UpdateTray();
-            tray.ShowMessage("通知方式", ModeText(mode), ToolTipIcon.Info);
-        }
-
-        private void SetSpeechChannel(string channel)
-        {
-            config.SpeechChannel = SpeechChannelNames.Normalize(channel);
-            SaveConfig();
-            RebuildSpeech(true);
-            UpdateTray();
-        }
-
-        private void OpenSettings()
-        {
-            if (settingsOpen) return;
-            settingsOpen = true;
-            discoveryTimer.Stop();
-            contextTimer.Stop();
-            if (listener != null) listener.Suspend();
-            try
-            {
-                using (SettingsForm form = new SettingsForm(config))
-                {
-                    if (form.ShowDialog() != DialogResult.OK) return;
-                    form.ApplyTo(config);
-                    string startupError;
-                    if (!StartupManager.SetEnabled(config.AutoStart, out startupError))
-                    {
-                        config.AutoStart = StartupManager.IsEnabled;
-                        ShowWarning("开机启动设置失败：" + startupError);
-                    }
-                    SaveConfig();
-                    hotkeys.RegisterAll(config, ReportHotkeyFailure);
-                    CreateListener();
-                    RebuildSpeech(true);
-                    BeginBindWechat();
-                    UpdateTray();
+                    section = line.Substring(1, line.Length - 2).Trim();
+                    continue;
                 }
+                int equals = line.IndexOf('=');
+                if (equals <= 0) continue;
+                string value = line.Substring(equals + 1);
+                int comment = value.IndexOf(';');
+                if (comment >= 0) value = value.Substring(0, comment);
+                result[section + "." + line.Substring(0, equals).Trim()] = value.Trim();
             }
-            catch (Exception ex)
-            {
-                AppLog.Write("设置窗口异常已隔离：" + ex.GetType().FullName + "，HRESULT=0x" + ex.HResult.ToString("X8") + "，" + ex.Message);
-            }
-            finally
-            {
-                settingsOpen = false;
-                if (listener != null) listener.Resume();
-                if (!exiting)
-                {
-                    discoveryTimer.Start();
-                    contextTimer.Start();
-                    BeginBindWechat();
-                }
-            }
+            return result;
         }
 
-        private void RebuildSpeech(bool notify)
+        private static string Get(IDictionary<string, string> values, string key, string fallback)
         {
-            if (speechQueue != null) speechQueue.Dispose();
-            ISpeechChannel channel = CreateSpeechChannel();
-            speechQueue = new SpeechQueue(channel, delegate(bool available, string error)
-            {
-                Dispatch(delegate
-                {
-                    UpdateTray();
-                    if (notify)
-                    {
-                        if (available) tray.ShowMessage("语音通道", "已启用：" + channel.Name, ToolTipIcon.Info);
-                        else ShowWarning(channel.Name + "暂不可用：" + error);
-                    }
-                });
-            });
+            string value;
+            return values.TryGetValue(key, out value) ? value : fallback;
         }
 
-        private ISpeechChannel CreateSpeechChannel()
+        private static bool GetBool(IDictionary<string, string> values, string key, bool fallback)
         {
-            return SpeechChannelFactory.Create(config);
+            bool value;
+            return bool.TryParse(Get(values, key, string.Empty), out value) ? value : fallback;
         }
 
-        private bool ShouldIgnoreSystemMessage(MessageData data)
+        private static int GetInt(IDictionary<string, string> values, string key, int fallback)
         {
-            if (!config.IgnoreSystemMessages || data == null || string.IsNullOrEmpty(data.Text)) return false;
-            if (!MessageFilter.IsSystemMessage(data.Text)) return false;
-            AppLog.Write("已过滤系统通知：" + data.Text);
-            return true;
+            int value;
+            return int.TryParse(Get(values, key, string.Empty), NumberStyles.Integer, CultureInfo.InvariantCulture, out value) ? value : fallback;
         }
 
-        private void ApplySavedStartup()
+        private static int Clamp(int value, int minimum, int maximum)
         {
-            if (!config.AutoStart) return;
-            string error;
-            if (!StartupManager.SetEnabled(true, out error)) AppLog.Write("恢复开机启动失败：" + error);
+            return Math.Max(minimum, Math.Min(maximum, value));
         }
 
-        private void MigrateLegacyHotkeys()
-        {
-            bool changed = false;
-            if (config.ReadLatestHotkey.Equals("Ctrl+Alt+M", StringComparison.OrdinalIgnoreCase) ||
-                config.ReadLatestHotkey.Equals("Ctrl+Shift+Alt+M", StringComparison.OrdinalIgnoreCase))
-            {
-                config.ReadLatestHotkey = "Ctrl+F11";
-                changed = true;
-            }
-            if (config.ToggleNotifyHotkey.Equals("Ctrl+Alt+N", StringComparison.OrdinalIgnoreCase) ||
-                config.ToggleNotifyHotkey.Equals("Ctrl+Shift+Alt+N", StringComparison.OrdinalIgnoreCase) ||
-                config.ToggleNotifyHotkey.Equals("Ctrl+Shift+F11", StringComparison.OrdinalIgnoreCase))
-            {
-                config.ToggleNotifyHotkey = "Alt+Shift+F8";
-                changed = true;
-            }
-            if (changed)
-            {
-                try { config.Save(); }
-                catch (Exception ex) { AppLog.Write("迁移冲突热键失败：" + ex.Message); }
-            }
-        }
+        private static string Bool(bool value) { return value ? "true" : "false"; }
 
-        private void SaveConfig()
+        private static string NormalizeBaoyiChannelName(string value)
         {
-            try { config.Save(); }
-            catch (Exception ex) { ShowWarning("保存设置失败：" + ex.Message); }
-        }
-
-        private void Dispatch(Action action)
-        {
-            if (exiting || IsDisposed) return;
-            try
-            {
-                if (InvokeRequired) BeginInvoke(action);
-                else action();
-            }
-            catch { }
-        }
-
-        private void UpdateTray()
-        {
-            if (tray == null) return;
-            string channel = speechQueue == null ? "未初始化" : speechQueue.ChannelName;
-            tray.Update(config.ListeningEnabled, config.NotificationMode, statusText, channel, config.SpeechChannel);
-        }
-
-        private void ShowWarning(string text)
-        {
-            AppLog.Write(text);
-            if (tray != null) tray.ShowMessage("微信消息助手", text, ToolTipIcon.Warning);
-        }
-
-        private void ReportHotkeyFailure(string text)
-        {
-            AppLog.Write(text);
-        }
-
-        private void ExitApplication()
-        {
-            exiting = true;
-            // The tray Exit command is a hard exit. UIA unsubscription and reader
-            // disposal can block inside external components; Windows releases those
-            // process resources, so do not keep the hidden process alive for cleanup.
-            if (speechQueue != null) speechQueue.ShutdownWithAnnouncement();
-            Environment.Exit(0);
-        }
-
-        private void WarnAboutNvda()
-        {
-            if (HasProcess("nvda")) ShowWarning("检测到 NVDA 正在运行。为避免重复朗读，建议与微信插件二选一使用。");
-        }
-
-        private static bool HasProcess(string prefix)
-        {
-            foreach (Process process in Process.GetProcesses())
-            {
-                try { if (process.ProcessName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true; }
-                catch { }
-                finally { process.Dispose(); }
-            }
-            return false;
-        }
-
-        private static string ModeText(NotificationMode mode)
-        {
-            if (mode == NotificationMode.Off) return "关闭";
-            if (mode == NotificationMode.SoundOnly) return "仅提示音";
-            if (mode == NotificationMode.SpeechOnly) return "仅朗读";
-            return "提示音 + 朗读";
+            return string.IsNullOrWhiteSpace(value) ? "WeChatMsg" : value.Trim();
         }
     }
 }

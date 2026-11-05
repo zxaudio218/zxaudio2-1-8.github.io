@@ -48,8 +48,8 @@ namespace WeChatMsgHelper
         public bool IgnoreSystemMessages;
         public bool AutoStart;
         public string SpeechChannel = SpeechChannelNames.ZhengduIndependent;
-        public string ReadLatestHotkey = "Ctrl+F11";
-        public string ToggleNotifyHotkey = "Alt+Shift+F8";
+        public string ReadLatestHotkey = "Ctrl+Alt+F11";
+        public string ToggleNotifyHotkey = "Ctrl+Alt+Shift+F11";
         public string ToggleModeHotkey = "Ctrl+Alt+P";
         public string OpenSettingsHotkey = "Ctrl+Alt+S";
         public bool ZhengduKeyDownInterrupt;
