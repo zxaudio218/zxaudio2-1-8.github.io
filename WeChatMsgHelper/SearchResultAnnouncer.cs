@@ -103,6 +103,21 @@ namespace WeChatMsgHelper
 
         public void Dispose()
         {
+            StopInputHooks();
+            try { if (focusSubscribed) Automation.RemoveAutomationFocusChangedEventHandler(focusHandler); }
+            catch { }
+            focusSubscribed = false;
+            try
+            {
+                if (invokeSubscribed)
+                    Automation.RemoveAutomationEventHandler(InvokePattern.InvokedEvent, AutomationElement.RootElement, invokeHandler);
+            }
+            catch { }
+            invokeSubscribed = false;
+        }
+
+        internal void StopInputHooks()
+        {
             if (keyboardHook != IntPtr.Zero)
             {
                 try { UnhookWindowsHookEx(keyboardHook); }
@@ -115,14 +130,6 @@ namespace WeChatMsgHelper
                 catch { }
                 mouseHook = IntPtr.Zero;
             }
-            try { if (focusSubscribed) Automation.RemoveAutomationFocusChangedEventHandler(focusHandler); }
-            catch { }
-            try
-            {
-                if (invokeSubscribed)
-                    Automation.RemoveAutomationEventHandler(InvokePattern.InvokedEvent, AutomationElement.RootElement, invokeHandler);
-            }
-            catch { }
         }
 
         private void OnFocusChanged(object sender, AutomationFocusChangedEventArgs args)

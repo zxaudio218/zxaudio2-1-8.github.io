@@ -50,20 +50,12 @@ namespace WeChatMsgHelper
             Shutdown(null);
         }
 
-        internal void ShutdownWithAnnouncement()
+        internal void PrepareForProcessExit()
         {
             if (disposed) return;
             disposed = true;
             stopping = true;
             signal.Set();
-            try
-            {
-                if (!channel.Submit("消息助手退出", true))
-                    AppLog.Write("退出提示提交失败：" + channel.Name);
-                else
-                    AppLog.Write("退出提示已提交：" + channel.Name);
-            }
-            catch (Exception ex) { AppLog.Write("退出提示异常：" + ex.Message); }
         }
 
         private void Shutdown(string announcement)
@@ -140,7 +132,7 @@ namespace WeChatMsgHelper
             Version version = Assembly.GetExecutingAssembly().GetName().Version;
             string value = version == null
                 ? "未知版本"
-                : version.Major + "." + version.Minor + "." + Math.Max(0, version.Build);
+                : version.Major + "." + version.Minor + "." + Math.Max(0, version.Build) + "." + Math.Max(0, version.Revision);
             return "微信消息助手 " + value;
         }
     }

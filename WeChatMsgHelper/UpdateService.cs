@@ -48,9 +48,9 @@ namespace WeChatMsgHelper
 
     internal static class UpdateReleaseNotes
     {
-        internal const string CurrentVersion = "1.8.1.0";
+        internal const string CurrentVersion = "1.8.2.1";
         internal const string Current =
-            "微信消息助手 1.8.1 更新内容\r\n\r\n" +
+            "微信消息助手 1.8.2.1 更新内容\r\n\r\n" +
             "1. 改进微信会话监听，减少打开会话后需要等待较长时间才开始朗读的问题。\r\n" +
             "2. 修复表情面板打开后，助手与屏幕阅读器重复朗读面板内容的问题。\r\n" +
             "3. 改进微信窗口和会话变化后的自动重新绑定。\r\n" +
@@ -58,7 +58,12 @@ namespace WeChatMsgHelper
             "5. 增加消息方向识别和监听过程的诊断日志，便于定位异常情况。\r\n" +
             "6. 托盘菜单新增“导出异常日志”，遇到问题时可导出日志并发送给开发者协助排查。\r\n" +
             "7. 日志改为按单次运行生成并限制文件大小；正常退出后自动清理，异常退出时保留最近一份日志供导出排查。\r\n" +
-            "8. 微信最小化或不在前台时，检测到音视频来电后可按 Alt+V 跳转到接听浮窗；通话浮窗关闭后会自动释放该快捷键。";
+            "8. 微信最小化或不在前台时，检测到音视频来电后可按 Alt+V 跳转到接听浮窗；通话浮窗关闭后会自动释放该快捷键。\r\n" +
+            "9. 改进在线更新对中文和空格路径的兼容性，修复程序存放在包含中文字符的目录中时可能更新失败的问题；更新完成后继续保留用户原有的程序文件名，例如“消息助手.exe”。\r\n" +
+            "10. 降低消息监听对微信进程的影响，合并高频界面事件、限制连续扫描并在微信响应缓慢时自动退避，减少微信未响应或异常退出的风险。\r\n" +
+            "11. 启动提示改为朗读完整四段版本号，例如 1.8.2.1。\r\n" +
+            "12. 更新回滚文件改为存放在用户数据更新目录，更新成功后自动清理，不再在程序所在目录生成备份文件。\r\n" +
+            "13. 优化退出流程，退出时优先解除全局输入监听，并避免同步调用外部语音接口，降低退出时系统卡顿或桌面无响应的风险。";
     }
 
     internal sealed class UpdateService
@@ -141,7 +146,9 @@ namespace WeChatMsgHelper
             int processId;
             using (Process current = Process.GetCurrentProcess()) processId = current.Id;
             ProcessStartInfo info = new ProcessStartInfo(packagePath,
-                "--apply-update " + processId + " " + Quote(packagePath) + " " + Quote(target));
+                "--apply-update-v2 " + processId + " " +
+                UpdateInstaller.EncodePathArgument(packagePath) + " " +
+                UpdateInstaller.EncodePathArgument(target));
             info.UseShellExecute = false;
             info.WorkingDirectory = Path.GetDirectoryName(packagePath);
             try
@@ -241,9 +248,5 @@ namespace WeChatMsgHelper
                 throw new InvalidDataException("更新服务器重定向到了不安全的地址。");
         }
 
-        private static string Quote(string value)
-        {
-            return "\"" + value.Replace("\"", "\\\"") + "\"";
-        }
     }
 }

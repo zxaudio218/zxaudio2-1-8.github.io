@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Automation;
@@ -29,6 +30,11 @@ namespace WeChatMsgHelper
         private static extern IntPtr GetWindow(IntPtr windowHandle, uint command);
 
         private const uint GwOwner = 4;
+        private const int StructureEventDelayMs = 120;
+        private const int MinimumExtractSpacingMs = 100;
+        private const int SlowExtractThresholdMs = 750;
+        private const int SlowExtractBackoffMs = 2000;
+        private static readonly long SlowExtractLogIntervalTicks = TimeSpan.FromSeconds(30).Ticks;
 
         private readonly MessageExtractor extractor;
         private readonly Action<MessageData> onMessage;
@@ -36,12 +42,16 @@ namespace WeChatMsgHelper
         private readonly Action<Action> dispatch;
         private readonly Action requestRebind;
         private readonly System.Windows.Forms.Timer pollTimer;
+        private readonly System.Threading.Timer extractDelayTimer;
         private readonly Dictionary<string, Binding> bindings = new Dictionary<string, Binding>(StringComparer.Ordinal);
         private readonly object bindingLock = new object();
         private readonly AutomationPropertyChangedEventHandler propertyHandler;
         private readonly StructureChangedEventHandler structureHandler;
         private int extractRunning;
         private int extractAgain;
+        private int extractScheduled;
+        private long nextExtractAllowedTicks;
+        private long lastSlowExtractLogTicks;
         private string lastForegroundBindingKey = string.Empty;
         private volatile bool suspended;
         private volatile bool disposed;
@@ -59,6 +69,11 @@ namespace WeChatMsgHelper
             pollTimer = new System.Windows.Forms.Timer();
             pollTimer.Interval = config.PollIntervalMs;
             pollTimer.Tick += delegate { QueueExtract(); };
+            extractDelayTimer = new System.Threading.Timer(delegate
+            {
+                Interlocked.Exchange(ref extractScheduled, 0);
+                QueueExtract();
+            }, null, Timeout.Infinite, Timeout.Infinite);
             PollEnabled = config.PollFallback;
         }
 
@@ -130,6 +145,7 @@ namespace WeChatMsgHelper
         {
             suspended = true;
             pollTimer.Stop();
+            CancelScheduledExtract();
             Interlocked.Exchange(ref extractAgain, 0);
         }
 
@@ -144,6 +160,7 @@ namespace WeChatMsgHelper
         {
             suspended = true;
             pollTimer.Stop();
+            CancelScheduledExtract();
             List<string> keys;
             lock (bindingLock) keys = new List<string>(bindings.Keys);
             foreach (string key in keys) RemoveBinding(key);
@@ -171,6 +188,7 @@ namespace WeChatMsgHelper
             disposed = true;
             Stop();
             pollTimer.Dispose();
+            extractDelayTimer.Dispose();
         }
 
         private void AddBinding(DiscoveredWechatRoot discovered, bool announce)
@@ -187,7 +205,7 @@ namespace WeChatMsgHelper
             };
             try
             {
-                Automation.AddStructureChangedEventHandler(binding.MessageList, TreeScope.Subtree, structureHandler);
+                Automation.AddStructureChangedEventHandler(binding.MessageList, TreeScope.Children, structureHandler);
                 binding.MessageListSubscribed = true;
                 SubscribeInput(binding);
                 lock (bindingLock) bindings[binding.Key] = binding;
@@ -275,12 +293,19 @@ namespace WeChatMsgHelper
 
         private void OnStructureChanged(object sender, StructureChangedEventArgs args)
         {
-            if (!suspended && !disposed) QueueExtract();
+            if (!suspended && !disposed) ScheduleExtract(StructureEventDelayMs);
         }
 
         private void QueueExtract()
         {
             if (suspended || disposed) return;
+            long nowTicks = DateTime.UtcNow.Ticks;
+            long allowedTicks = Interlocked.Read(ref nextExtractAllowedTicks);
+            if (allowedTicks > nowTicks)
+            {
+                ScheduleExtract(ToDelayMilliseconds(allowedTicks - nowTicks));
+                return;
+            }
             if (Interlocked.CompareExchange(ref extractRunning, 1, 0) != 0)
             {
                 Interlocked.Exchange(ref extractAgain, 1);
@@ -292,23 +317,63 @@ namespace WeChatMsgHelper
 
         private void ExtractWorker()
         {
+            Stopwatch stopwatch = Stopwatch.StartNew();
             try
             {
-                do
-                {
-                    Interlocked.Exchange(ref extractAgain, 0);
-                    if (suspended || disposed) break;
-                    List<Binding> snapshot;
-                    lock (bindingLock) snapshot = new List<Binding>(bindings.Values);
-                    ExtractAndEmit(snapshot);
-                }
-                while (Interlocked.Exchange(ref extractAgain, 0) != 0 && !suspended && !disposed);
+                Interlocked.Exchange(ref extractAgain, 0);
+                if (suspended || disposed) return;
+                List<Binding> snapshot;
+                lock (bindingLock) snapshot = new List<Binding>(bindings.Values);
+                ExtractAndEmit(snapshot);
             }
             finally
             {
+                stopwatch.Stop();
+                int spacing = stopwatch.ElapsedMilliseconds >= SlowExtractThresholdMs
+                    ? SlowExtractBackoffMs
+                    : MinimumExtractSpacingMs;
+                Interlocked.Exchange(ref nextExtractAllowedTicks, DateTime.UtcNow.AddMilliseconds(spacing).Ticks);
+                if (stopwatch.ElapsedMilliseconds >= SlowExtractThresholdMs) LogSlowExtract(stopwatch.ElapsedMilliseconds);
                 Interlocked.Exchange(ref extractRunning, 0);
-                if (Interlocked.Exchange(ref extractAgain, 0) != 0 && !suspended && !disposed) QueueExtract();
+                if (Interlocked.Exchange(ref extractAgain, 0) != 0 && !suspended && !disposed)
+                    ScheduleExtract(spacing);
             }
+        }
+
+        private void ScheduleExtract(int delayMilliseconds)
+        {
+            if (suspended || disposed) return;
+            if (Interlocked.CompareExchange(ref extractScheduled, 1, 0) != 0) return;
+            try
+            {
+                extractDelayTimer.Change(Math.Max(1, delayMilliseconds), Timeout.Infinite);
+            }
+            catch (ObjectDisposedException)
+            {
+                Interlocked.Exchange(ref extractScheduled, 0);
+            }
+        }
+
+        private void CancelScheduledExtract()
+        {
+            Interlocked.Exchange(ref extractScheduled, 0);
+            try { extractDelayTimer.Change(Timeout.Infinite, Timeout.Infinite); }
+            catch (ObjectDisposedException) { }
+        }
+
+        private void LogSlowExtract(long elapsedMilliseconds)
+        {
+            long nowTicks = DateTime.UtcNow.Ticks;
+            long previousTicks = Interlocked.Read(ref lastSlowExtractLogTicks);
+            if (previousTicks != 0 && nowTicks - previousTicks < SlowExtractLogIntervalTicks) return;
+            if (Interlocked.CompareExchange(ref lastSlowExtractLogTicks, nowTicks, previousTicks) != previousTicks) return;
+            AppLog.Write("微信消息扫描耗时=" + elapsedMilliseconds + "ms，已暂缓扫描以降低对微信进程的影响");
+        }
+
+        private static int ToDelayMilliseconds(long ticks)
+        {
+            double milliseconds = TimeSpan.FromTicks(Math.Max(0, ticks)).TotalMilliseconds;
+            return (int)Math.Max(1, Math.Min(SlowExtractBackoffMs, Math.Ceiling(milliseconds)));
         }
 
         private void ExtractAndEmit(IList<Binding> snapshot)

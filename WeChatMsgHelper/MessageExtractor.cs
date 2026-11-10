@@ -316,12 +316,8 @@ namespace WeChatMsgHelper
             string normalizedMessage = NormalizeForMatch(messageText);
             try
             {
-                AutomationElementCollection descendants = item.FindAll(TreeScope.Descendants, Condition.TrueCondition);
-                for (int index = 0; index < descendants.Count; index++)
-                    ScoreContentCandidate(listRect, descendants[index], normalizedMessage, ref best, ref bestScore, ref bestArea);
-
-                // Qt exposes some chat bubble children only in the raw UIA view.
-                foreach (AutomationElement element in GetRawDescendants(item, 96))
+                // Keep this traversal bounded. Unbounded UIA descendant scans can overload WeChat's provider.
+                foreach (AutomationElement element in GetRawDescendants(item, 48))
                     ScoreContentCandidate(listRect, element, normalizedMessage, ref best, ref bestScore, ref bestArea);
             }
             catch { }
@@ -396,42 +392,11 @@ namespace WeChatMsgHelper
             {
                 System.Windows.Rect listRect = list.Current.BoundingRectangle;
                 System.Windows.Rect itemRect = item.Current.BoundingRectangle;
+                string automationId = item.Current.AutomationId ?? string.Empty;
+                string className = item.Current.ClassName ?? string.Empty;
                 AppLog.Write("未知方向诊断：列表=" + FormatRectangle(listRect) + "，消息项=" + FormatRectangle(itemRect) +
-                    "，消息长度=" + (messageText ?? string.Empty).Length);
-
-                string normalizedMessage = NormalizeForMatch(messageText);
-                AutomationElementCollection descendants = item.FindAll(TreeScope.Descendants, Condition.TrueCondition);
-                int count = Math.Min(descendants.Count, 24);
-                for (int index = 0; index < count; index++)
-                {
-                    AutomationElement element = descendants[index];
-                    AutomationElement.AutomationElementInformation current = element.Current;
-                    string name = Clean(current.Name);
-                    string normalizedName = NormalizeForMatch(name);
-                    bool matchesMessage = normalizedMessage.Length > 0 && normalizedName == normalizedMessage;
-                    string controlType = current.ControlType == null ? string.Empty : current.ControlType.ProgrammaticName;
-                    AppLog.Write("未知方向子控件[" + index + "]：类型=" + controlType +
-                        "，AutomationId=" + (current.AutomationId ?? string.Empty) +
-                        "，ClassName=" + (current.ClassName ?? string.Empty) +
-                        "，坐标=" + FormatRectangle(current.BoundingRectangle) +
-                        "，文字长度=" + name.Length + "，匹配正文=" + matchesMessage);
-                }
-
-                IList<AutomationElement> rawDescendants = GetRawDescendants(item, 24);
-                AppLog.Write("未知方向原始子控件数=" + rawDescendants.Count);
-                for (int index = 0; index < rawDescendants.Count; index++)
-                {
-                    AutomationElement.AutomationElementInformation current = rawDescendants[index].Current;
-                    string name = Clean(current.Name);
-                    string normalizedName = NormalizeForMatch(name);
-                    bool matchesMessage = normalizedMessage.Length > 0 && normalizedName == normalizedMessage;
-                    string controlType = current.ControlType == null ? string.Empty : current.ControlType.ProgrammaticName;
-                    AppLog.Write("未知方向原始子控件[" + index + "]：类型=" + controlType +
-                        "，AutomationId=" + (current.AutomationId ?? string.Empty) +
-                        "，ClassName=" + (current.ClassName ?? string.Empty) +
-                        "，坐标=" + FormatRectangle(current.BoundingRectangle) +
-                        "，文字长度=" + name.Length + "，匹配正文=" + matchesMessage);
-                }
+                    "，消息长度=" + (messageText ?? string.Empty).Length +
+                    "，AutomationId=" + automationId + "，ClassName=" + className);
             }
             catch (Exception ex)
             {
@@ -449,7 +414,7 @@ namespace WeChatMsgHelper
         {
             try
             {
-                AutomationElementCollection descendants = item.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                IList<AutomationElement> descendants = GetRawDescendants(item, 24);
                 for (int index = 0; index < descendants.Count; index++)
                 {
                     string name = descendants[index].Current.Name ?? string.Empty;

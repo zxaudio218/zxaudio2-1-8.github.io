@@ -14,8 +14,9 @@ namespace WeChatMsgHelper
     {
         private const int WmHotkey = 0x0312;
         private const int DiscoveryFastIntervalMs = 500;
-        private const int DiscoveryStableIntervalMs = 1000;
+        private const int DiscoveryStableIntervalMs = 2000;
         private const int DiscoveryIdleIntervalMs = 2000;
+        private const int ContextProbeIntervalMs = 500;
         private const int VoipProbeIntervalMs = 1000;
         private readonly Discovery discovery = new Discovery();
         private readonly MessageSoundPlayer messageSounds = new MessageSoundPlayer();
@@ -40,6 +41,7 @@ namespace WeChatMsgHelper
         private bool wechatWasForeground;
         private int discoveryPending;
         private int voipProbePending;
+        private int exitStarted;
         private bool updateCheckPending;
 
         public MainForm()
@@ -73,7 +75,7 @@ namespace WeChatMsgHelper
             discoveryTimer.Interval = DiscoveryFastIntervalMs;
             discoveryTimer.Tick += delegate { BeginBindWechat(); };
             discoveryTimer.Start();
-            contextTimer.Interval = 250;
+            contextTimer.Interval = ContextProbeIntervalMs;
             contextTimer.Tick += delegate { SafeUpdateContextHotkeys(); };
             contextTimer.Start();
             voipTimer.Interval = VoipProbeIntervalMs;
@@ -107,23 +109,15 @@ namespace WeChatMsgHelper
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (!exiting) exiting = true;
-            discoveryTimer.Stop();
-            contextTimer.Stop();
-            voipTimer.Stop();
-            hotkeyFallbackTimer.Stop();
-            // Speak before UIA and worker cleanup so the exit announcement is immediate.
-            if (speechQueue != null) speechQueue.ShutdownWithAnnouncement();
-            if (listener != null) listener.Dispose();
-            if (reviewManager != null) reviewManager.Dispose();
-            if (searchAnnouncer != null) searchAnnouncer.Dispose();
-            if (messageSounds != null) messageSounds.Dispose();
-            if (hotkeys != null) hotkeys.Dispose();
-            if (tray != null) tray.Dispose();
-            discoveryTimer.Dispose();
-            contextTimer.Dispose();
-            voipTimer.Dispose();
-            hotkeyFallbackTimer.Dispose();
+            exiting = true;
+            if (Interlocked.Exchange(ref exitStarted, 1) == 0) StartExitWatchdog();
+            StopRuntimeTimers();
+            if (speechQueue != null) speechQueue.PrepareForProcessExit();
+            if (searchAnnouncer != null) searchAnnouncer.StopInputHooks();
+            try { if (hotkeys != null) hotkeys.Dispose(); }
+            catch { }
+            try { if (tray != null) tray.Dispose(); }
+            catch { }
             base.OnFormClosing(e);
         }
 
@@ -618,7 +612,7 @@ namespace WeChatMsgHelper
 
         private void ShowCurrentReleaseNotes()
         {
-            using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 1.8.1 更新日志", UpdateReleaseNotes.Current, false))
+            using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 1.8.2.1 更新日志", UpdateReleaseNotes.Current, false))
                 form.ShowDialog();
         }
 
@@ -648,13 +642,35 @@ namespace WeChatMsgHelper
 
         private void ExitApplication()
         {
+            if (Interlocked.Exchange(ref exitStarted, 1) != 0) return;
             exiting = true;
-            // The tray Exit command is a hard exit. UIA unsubscription and reader
-            // disposal can block inside external components; Windows releases those
-            // process resources, so do not keep the hidden process alive for cleanup.
-            if (speechQueue != null) speechQueue.ShutdownWithAnnouncement();
-            AppLog.DeleteCurrent();
-            Environment.Exit(0);
+            StartExitWatchdog();
+            try { BeginInvoke(new Action(Close)); }
+            catch { Environment.Exit(0); }
+        }
+
+        private void StopRuntimeTimers()
+        {
+            discoveryTimer.Stop();
+            contextTimer.Stop();
+            voipTimer.Stop();
+            hotkeyFallbackTimer.Stop();
+        }
+
+        private static void StartExitWatchdog()
+        {
+            Thread watchdog = new Thread(new ThreadStart(delegate
+            {
+                Thread.Sleep(1500);
+                try
+                {
+                    using (Process current = Process.GetCurrentProcess()) current.Kill();
+                }
+                catch { }
+            }));
+            watchdog.IsBackground = true;
+            watchdog.Name = "WeChatMsgHelper Exit Watchdog";
+            watchdog.Start();
         }
 
         private void WarnAboutNvda()

@@ -6,5 +6,5 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyProduct("WeChatMsgHelper")]
 [assembly: ComVisible(false)]
 [assembly: Guid("E051883A-7B29-47DE-AD8A-DB5E7CD9167D")]
-[assembly: AssemblyVersion("1.8.1.0")]
-[assembly: AssemblyFileVersion("1.8.1.0")]
+[assembly: AssemblyVersion("1.8.2.1")]
+[assembly: AssemblyFileVersion("1.8.2.1")]
