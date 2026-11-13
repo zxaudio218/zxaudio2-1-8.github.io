@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Media;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 using WeChatMsgHelper.Channels;
@@ -18,6 +19,15 @@ namespace WeChatMsgHelper
         private const int DiscoveryIdleIntervalMs = 2000;
         private const int ContextProbeIntervalMs = 500;
         private const int VoipProbeIntervalMs = 1000;
+        private const int SwShow = 5;
+        private const int SwRestore = 9;
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr window, int command);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr window);
+
         private readonly Discovery discovery = new Discovery();
         private readonly MessageSoundPlayer messageSounds = new MessageSoundPlayer();
         private readonly WeChatNavigator navigator = new WeChatNavigator();
@@ -31,6 +41,7 @@ namespace WeChatMsgHelper
         private SpeechQueue speechQueue;
         private HotkeyManager hotkeys;
         private TrayIcon tray;
+        private SettingsForm activeSettingsForm;
         private MessageReviewManager reviewManager;
         private SearchResultAnnouncer searchAnnouncer;
         private readonly UpdateService updateService = new UpdateService();
@@ -62,10 +73,10 @@ namespace WeChatMsgHelper
             foreach (string warning in migrationWarnings) AppLog.Write(warning);
             config = LoadConfig();
             MigrateLegacyHotkeys();
-            tray = new TrayIcon(ToggleListening, SetMode, SetSpeechChannel, ReadLatest, TestSpeech, OpenSettings,
+            tray = new TrayIcon(ToggleListening, SetMode, SetSpeechChannel, ReadLatest, TestSpeech, RequestOpenSettings,
                 delegate { CheckForUpdates(true); }, ShowCurrentReleaseNotes, ExportLog, ExitApplication);
             hotkeys = new HotkeyManager(Handle);
-            hotkeys.RegisterAll(config, ReportHotkeyFailure);
+            IList<string> startupHotkeyFailures = hotkeys.RegisterAll(config, ReportHotkeyFailure);
             CreateListener();
             RebuildSpeech(false);
             searchAnnouncer = new SearchResultAnnouncer(Dispatch, SpeakText,
@@ -89,6 +100,7 @@ namespace WeChatMsgHelper
             WarnAboutNvda();
             BeginInvoke(new Action(delegate
             {
+                PromptToModifyConflictingHotkeys(startupHotkeyFailures);
                 ShowInstalledReleaseNotes();
                 UpdateInstaller.CleanupOldFiles();
                 CheckForUpdates(false);
@@ -137,7 +149,7 @@ namespace WeChatMsgHelper
                 case HotkeyManager.ReadLatestId: ReadLatest(); break;
                 case HotkeyManager.ToggleNotifyId: ToggleListening(); break;
                 case HotkeyManager.ToggleModeId: CycleMode(); break;
-                case HotkeyManager.OpenSettingsId: OpenSettings(); break;
+                case HotkeyManager.OpenSettingsId: RequestOpenSettings(); break;
                 case HotkeyManager.TestSpeechId: TestSpeech(); break;
                 case HotkeyManager.FocusOfficialAccountsId: FocusOfficialAccounts(); break;
                 case HotkeyManager.FocusContactsId: FocusContacts(); break;
@@ -367,6 +379,7 @@ namespace WeChatMsgHelper
         private void ToggleListening()
         {
             config.ListeningEnabled = !config.ListeningEnabled;
+            if (!config.ListeningEnabled && speechQueue != null) speechQueue.StopAndClear();
             SaveConfig();
             UpdateTray();
             tray.ShowMessage("微信消息助手", config.ListeningEnabled ? "已开始监听新消息。" : "已停止监听新消息。", ToolTipIcon.Info);
@@ -394,10 +407,27 @@ namespace WeChatMsgHelper
             UpdateTray();
         }
 
+        private void RequestOpenSettings()
+        {
+            if (settingsOpen)
+            {
+                ActivateSettingsWindow();
+                return;
+            }
+            try { BeginInvoke(new Action(OpenSettings)); }
+            catch (Exception ex) { AppLog.Write("请求打开设置失败：" + ex.Message); }
+        }
+
         private void OpenSettings()
         {
-            if (settingsOpen) return;
+            if (settingsOpen)
+            {
+                ActivateSettingsWindow();
+                return;
+            }
             settingsOpen = true;
+            IList<string> hotkeyFailures = null;
+            bool settingsSaved = false;
             discoveryTimer.Stop();
             contextTimer.Stop();
             voipTimer.Stop();
@@ -407,6 +437,10 @@ namespace WeChatMsgHelper
             {
                 using (SettingsForm form = new SettingsForm(config))
                 {
+                    activeSettingsForm = form;
+                    form.HotkeyCaptureStarted += SuspendHotkeysForCapture;
+                    form.HotkeyCaptureEnded += RestoreHotkeysAfterCapture;
+                    form.Shown += delegate { ActivateSettingsWindow(); };
                     if (form.ShowDialog() != DialogResult.OK) return;
                     form.ApplyTo(config);
                     string startupError;
@@ -416,7 +450,7 @@ namespace WeChatMsgHelper
                         ShowWarning("开机启动设置失败：" + startupError);
                     }
                     SaveConfig();
-                    hotkeys.RegisterAll(config, ReportHotkeyFailure);
+                    settingsSaved = true;
                     CreateListener();
                     RebuildSpeech(true);
                     BeginBindWechat();
@@ -429,6 +463,8 @@ namespace WeChatMsgHelper
             }
             finally
             {
+                hotkeyFailures = hotkeys.RegisterAll(config, ReportHotkeyFailure);
+                activeSettingsForm = null;
                 settingsOpen = false;
                 if (listener != null) listener.Resume();
                 if (!exiting)
@@ -438,7 +474,60 @@ namespace WeChatMsgHelper
                     voipTimer.Start();
                     BeginBindWechat();
                     BeginUpdateVoipContext();
+                    UpdateHotkeyFallbackTimer();
                 }
+            }
+            if (settingsSaved && hotkeyFailures != null && hotkeyFailures.Count > 0 && !exiting)
+            {
+                try { BeginInvoke(new Action(delegate { PromptToModifyConflictingHotkeys(hotkeyFailures); })); }
+                catch { }
+            }
+        }
+
+        private void ActivateSettingsWindow()
+        {
+            SettingsForm form = activeSettingsForm;
+            if (form == null || form.IsDisposed) return;
+            IntPtr handle = form.Handle;
+            ShowWindow(handle, form.WindowState == FormWindowState.Minimized ? SwRestore : SwShow);
+            if (form.WindowState == FormWindowState.Minimized) form.WindowState = FormWindowState.Normal;
+            form.BringToFront();
+            form.Activate();
+            SetForegroundWindow(handle);
+        }
+
+        private void SuspendHotkeysForCapture(object sender, EventArgs args)
+        {
+            hotkeyFallbackTimer.Stop();
+            hotkeys.UnregisterAll();
+        }
+
+        private void RestoreHotkeysAfterCapture(object sender, EventArgs args)
+        {
+            if (exiting || !settingsOpen) return;
+            hotkeys.RegisterAll(config, ReportHotkeyFailure);
+            UpdateHotkeyFallbackTimer();
+        }
+
+        private void PromptToModifyConflictingHotkeys(IList<string> failures)
+        {
+            if (failures == null || failures.Count == 0 || exiting) return;
+            string signature = string.Join("|", new List<string>(failures).ToArray());
+            if (string.Equals(config.SuppressedHotkeyConflictSignature, signature, StringComparison.Ordinal))
+            {
+                AppLog.Write("已按用户设置跳过这组快捷键冲突提示：" + string.Join("；", new List<string>(failures).ToArray()));
+                return;
+            }
+            AppLog.Write("检测到快捷键冲突：" + string.Join("；", new List<string>(failures).ToArray()));
+            using (HotkeyConflictDialog dialog = new HotkeyConflictDialog(failures))
+            {
+                DialogResult result = dialog.ShowDialog();
+                if (dialog.SuppressThisGroup)
+                {
+                    config.SuppressedHotkeyConflictSignature = signature;
+                    SaveConfig();
+                }
+                if (result == DialogResult.Yes) OpenSettings();
             }
         }
 
@@ -487,7 +576,7 @@ namespace WeChatMsgHelper
                 config.ReadLatestHotkey.Equals("Ctrl+Shift+Alt+M", StringComparison.OrdinalIgnoreCase) ||
                 config.ReadLatestHotkey.Equals("Ctrl+F11", StringComparison.OrdinalIgnoreCase))
             {
-                config.ReadLatestHotkey = "Ctrl+Alt+F11";
+                config.ReadLatestHotkey = AppConfig.DefaultReadLatestHotkey;
                 changed = true;
             }
             if (config.ToggleNotifyHotkey.Equals("Ctrl+Alt+N", StringComparison.OrdinalIgnoreCase) ||
@@ -495,7 +584,7 @@ namespace WeChatMsgHelper
                 config.ToggleNotifyHotkey.Equals("Ctrl+Shift+F11", StringComparison.OrdinalIgnoreCase) ||
                 config.ToggleNotifyHotkey.Equals("Alt+Shift+F8", StringComparison.OrdinalIgnoreCase))
             {
-                config.ToggleNotifyHotkey = "Ctrl+Alt+Shift+F11";
+                config.ToggleNotifyHotkey = AppConfig.DefaultToggleNotifyHotkey;
                 changed = true;
             }
             if (changed)
@@ -612,7 +701,7 @@ namespace WeChatMsgHelper
 
         private void ShowCurrentReleaseNotes()
         {
-            using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 1.8.2.1 更新日志", UpdateReleaseNotes.Current, false))
+            using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 " + UpdateReleaseNotes.CurrentVersion + " 更新日志", UpdateReleaseNotes.Current, false))
                 form.ShowDialog();
         }
 
@@ -645,6 +734,7 @@ namespace WeChatMsgHelper
             if (Interlocked.Exchange(ref exitStarted, 1) != 0) return;
             exiting = true;
             StartExitWatchdog();
+            if (speechQueue != null) speechQueue.AnnounceProcessExit("消息助手退出");
             try { BeginInvoke(new Action(Close)); }
             catch { Environment.Exit(0); }
         }

@@ -22,25 +22,32 @@ namespace WeChatMsgHelper
         private readonly NumericUpDown pollInterval = new NumericUpDown();
         private readonly NumericUpDown sapiRate = new NumericUpDown();
         private readonly NumericUpDown sapiVolume = new NumericUpDown();
-        private readonly TextBox readLatestBox = new TextBox();
-        private readonly TextBox toggleNotifyBox = new TextBox();
-        private readonly TextBox toggleModeBox = new TextBox();
-        private readonly TextBox openSettingsBox = new TextBox();
         private readonly System.Windows.Forms.Timer voiceLoadTimeout = new System.Windows.Forms.Timer();
         private readonly string savedSapiVoice;
+        private string readLatestHotkey;
+        private string toggleNotifyHotkey;
+        private string toggleModeHotkey;
+        private string openSettingsHotkey;
         private bool voiceLoadStarted;
         private bool voicesLoaded;
+
+        internal event EventHandler HotkeyCaptureStarted;
+        internal event EventHandler HotkeyCaptureEnded;
 
         internal SettingsForm(AppConfig config)
         {
             savedSapiVoice = config.Sapi5Voice ?? string.Empty;
+            readLatestHotkey = config.ReadLatestHotkey;
+            toggleNotifyHotkey = config.ToggleNotifyHotkey;
+            toggleModeHotkey = config.ToggleModeHotkey;
+            openSettingsHotkey = config.OpenSettingsHotkey;
             Text = "微信消息助手设置";
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = true;
-            ClientSize = new Size(570, 652);
+            ClientSize = new Size(570, 556);
             AutoScaleMode = AutoScaleMode.Dpi;
 
             TableLayoutPanel layout = new TableLayoutPanel();
@@ -49,8 +56,10 @@ namespace WeChatMsgHelper
             layout.ColumnCount = 2;
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 175));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            layout.RowCount = 19;
-            for (int index = 0; index < 17; index++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 31));
+            layout.RowCount = 16;
+            layout.TabStop = false;
+            for (int index = 0; index < 13; index++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 31));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
@@ -103,11 +112,6 @@ namespace WeChatMsgHelper
             pollInterval.Maximum = 5000;
             pollInterval.Increment = 100;
             pollInterval.Value = config.PollIntervalMs;
-            readLatestBox.Text = config.ReadLatestHotkey;
-            toggleNotifyBox.Text = config.ToggleNotifyHotkey;
-            toggleModeBox.Text = config.ToggleModeHotkey;
-            openSettingsBox.Text = config.OpenSettingsHotkey;
-
             AddRow(layout, 0, "监听", listeningBox);
             AddRow(layout, 1, "通知方式", modeBox);
             AddRow(layout, 2, "语音通道", speechChannelBox);
@@ -121,29 +125,39 @@ namespace WeChatMsgHelper
             AddRow(layout, 10, "系统通知", systemMessageBox);
             AddRow(layout, 11, "开机启动", autoStartBox);
             AddRow(layout, 12, "按键打断", keyInterruptBox);
-            AddRow(layout, 13, "朗读最新", readLatestBox);
-            AddRow(layout, 14, "启动/停止监听", toggleNotifyBox);
-            AddRow(layout, 15, "切换通知方式", toggleModeBox);
-            AddRow(layout, 16, "打开设置", openSettingsBox);
+
+            Button hotkeySettingsButton = new Button();
+            hotkeySettingsButton.Text = "快捷键设置...";
+            hotkeySettingsButton.AccessibleName = "快捷键设置";
+            hotkeySettingsButton.AutoSize = true;
+            hotkeySettingsButton.TabIndex = 13;
+            hotkeySettingsButton.Click += OpenHotkeySettings;
+            layout.Controls.Add(FixedLabel("快捷键"), 0, 13);
+            layout.Controls.Add(hotkeySettingsButton, 1, 13);
 
             Label note = FixedLabel("微信前台支持 F3、Alt+P/T/V；输入框聚焦时支持 Ctrl+Alt+上/下/Home/End。打开新会话后会自动朗读最后一条消息。配置和日志保存在当前用户的 LocalAppData，不写到桌面。") as Label;
             note.AutoSize = false;
             note.Dock = DockStyle.Fill;
-            layout.Controls.Add(note, 0, 17);
+            layout.Controls.Add(note, 0, 14);
             layout.SetColumnSpan(note, 2);
 
             FlowLayoutPanel buttons = new FlowLayoutPanel();
             buttons.FlowDirection = FlowDirection.RightToLeft;
             buttons.Dock = DockStyle.Fill;
+            buttons.TabStop = false;
             Button okButton = new Button();
             okButton.Text = "确定";
+            okButton.AccessibleName = "确定";
             okButton.DialogResult = DialogResult.OK;
+            okButton.TabIndex = 0;
             Button cancelButton = new Button();
             cancelButton.Text = "取消";
+            cancelButton.AccessibleName = "取消";
             cancelButton.DialogResult = DialogResult.Cancel;
+            cancelButton.TabIndex = 1;
             buttons.Controls.Add(okButton);
             buttons.Controls.Add(cancelButton);
-            layout.Controls.Add(buttons, 0, 18);
+            layout.Controls.Add(buttons, 0, 15);
             layout.SetColumnSpan(buttons, 2);
             Controls.Add(layout);
             AcceptButton = okButton;
@@ -167,10 +181,10 @@ namespace WeChatMsgHelper
             config.IgnoreSystemMessages = systemMessageBox.Checked;
             config.AutoStart = autoStartBox.Checked;
             config.ZhengduKeyDownInterrupt = keyInterruptBox.Checked;
-            config.ReadLatestHotkey = readLatestBox.Text.Trim();
-            config.ToggleNotifyHotkey = toggleNotifyBox.Text.Trim();
-            config.ToggleModeHotkey = toggleModeBox.Text.Trim();
-            config.OpenSettingsHotkey = openSettingsBox.Text.Trim();
+            config.ReadLatestHotkey = readLatestHotkey;
+            config.ToggleNotifyHotkey = toggleNotifyHotkey;
+            config.ToggleModeHotkey = toggleModeHotkey;
+            config.OpenSettingsHotkey = openSettingsHotkey;
         }
 
         protected override void Dispose(bool disposing)
@@ -267,8 +281,37 @@ namespace WeChatMsgHelper
         {
             Label label = FixedLabel(labelText) as Label;
             control.Dock = DockStyle.Fill;
+            control.TabIndex = row;
+            if (string.IsNullOrEmpty(control.AccessibleName)) control.AccessibleName = labelText;
             layout.Controls.Add(label, 0, row);
             layout.Controls.Add(control, 1, row);
+        }
+
+        private void OpenHotkeySettings(object sender, EventArgs args)
+        {
+            using (HotkeySettingsForm form = new HotkeySettingsForm(
+                readLatestHotkey, toggleNotifyHotkey, toggleModeHotkey, openSettingsHotkey))
+            {
+                form.HotkeyCaptureStarted += ForwardHotkeyCaptureStarted;
+                form.HotkeyCaptureEnded += ForwardHotkeyCaptureEnded;
+                if (form.ShowDialog(this) != DialogResult.OK) return;
+                readLatestHotkey = form.ReadLatestHotkey;
+                toggleNotifyHotkey = form.ToggleNotifyHotkey;
+                toggleModeHotkey = form.ToggleModeHotkey;
+                openSettingsHotkey = form.OpenSettingsHotkey;
+            }
+        }
+
+        private void ForwardHotkeyCaptureStarted(object sender, EventArgs args)
+        {
+            EventHandler handler = HotkeyCaptureStarted;
+            if (handler != null) handler(this, EventArgs.Empty);
+        }
+
+        private void ForwardHotkeyCaptureEnded(object sender, EventArgs args)
+        {
+            EventHandler handler = HotkeyCaptureEnded;
+            if (handler != null) handler(this, EventArgs.Empty);
         }
 
         private static Control FixedLabel(string text)
@@ -277,6 +320,7 @@ namespace WeChatMsgHelper
             label.Text = text;
             label.Dock = DockStyle.Fill;
             label.TextAlign = ContentAlignment.MiddleLeft;
+            label.TabStop = false;
             return label;
         }
     }

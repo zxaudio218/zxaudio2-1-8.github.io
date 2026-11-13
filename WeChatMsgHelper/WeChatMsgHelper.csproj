@@ -22,7 +22,7 @@
     <Reference Include="UIAutomationClient"/><Reference Include="UIAutomationProvider"/><Reference Include="UIAutomationTypes"/><Reference Include="WindowsBase"/>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="AppDataPaths.cs"/><Compile Include="AppLog.cs"/><Compile Include="Config.cs"/><Compile Include="Discovery.cs"/><Compile Include="HotkeyManager.cs"/>
+    <Compile Include="AppDataPaths.cs"/><Compile Include="AppLog.cs"/><Compile Include="Config.cs"/><Compile Include="Discovery.cs"/><Compile Include="HotkeyConflictDialog.cs"><SubType>Form</SubType></Compile><Compile Include="HotkeyManager.cs"/><Compile Include="HotkeySettingsForm.cs"><SubType>Form</SubType></Compile><Compile Include="HotkeyTextBox.cs"/>
     <Compile Include="MainForm.cs"><SubType>Form</SubType></Compile><Compile Include="MessageExtractor.cs"/><Compile Include="MessageFilter.cs"/><Compile Include="MessageListener.cs"/>
     <Compile Include="MessageReviewManager.cs"/><Compile Include="SearchResultAnnouncer.cs"/><Compile Include="WeChatNavigator.cs"/>
     <Compile Include="Program.cs"/><Compile Include="SettingsForm.cs"><SubType>Form</SubType></Compile><Compile Include="SpeechQueue.cs"/><Compile Include="MessageSoundPlayer.cs"/>

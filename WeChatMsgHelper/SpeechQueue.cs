@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Concurrent;
-using System.Reflection;
+using System.Collections.Generic;
 using System.Threading;
 using WeChatMsgHelper.Channels;
 
@@ -8,7 +8,16 @@ namespace WeChatMsgHelper
 {
     internal sealed class SpeechQueue : IDisposable
     {
-        private readonly ConcurrentQueue<string> queue = new ConcurrentQueue<string>();
+        private const int MaxSpeechChunkLength = 1000;
+        private const int PreferredSplitStart = 600;
+
+        private sealed class SpeechRequest
+        {
+            internal string Text;
+            internal int StopVersion;
+        }
+
+        private readonly ConcurrentQueue<SpeechRequest> queue = new ConcurrentQueue<SpeechRequest>();
         private readonly AutoResetEvent signal = new AutoResetEvent(false);
         private readonly Thread worker;
         private readonly ISpeechChannel channel;
@@ -16,6 +25,7 @@ namespace WeChatMsgHelper
         private volatile bool stopping;
         private bool disposed;
         private int queuedCount;
+        private int stopVersion;
 
         internal SpeechQueue(ISpeechChannel channel, Action<bool, string> onInitialized)
         {
@@ -34,14 +44,28 @@ namespace WeChatMsgHelper
         internal void Enqueue(string text)
         {
             if (stopping || string.IsNullOrWhiteSpace(text)) return;
-            queue.Enqueue(text);
+            queue.Enqueue(new SpeechRequest
+            {
+                Text = text,
+                StopVersion = Thread.VolatileRead(ref stopVersion)
+            });
             int count = Interlocked.Increment(ref queuedCount);
             while (count > 200)
             {
-                string ignored;
+                SpeechRequest ignored;
                 if (!queue.TryDequeue(out ignored)) break;
                 count = Interlocked.Decrement(ref queuedCount);
             }
+            signal.Set();
+        }
+
+        internal void StopAndClear()
+        {
+            Interlocked.Increment(ref stopVersion);
+            SpeechRequest ignored;
+            while (queue.TryDequeue(out ignored)) Interlocked.Decrement(ref queuedCount);
+            try { channel.Stop(); }
+            catch (Exception ex) { AppLog.Write("停止当前朗读失败：" + ex.Message); }
             signal.Set();
         }
 
@@ -56,6 +80,16 @@ namespace WeChatMsgHelper
             disposed = true;
             stopping = true;
             signal.Set();
+        }
+
+        internal void AnnounceProcessExit(string announcement)
+        {
+            if (disposed || string.IsNullOrWhiteSpace(announcement)) return;
+            stopping = true;
+            try { channel.Stop(); }
+            catch { }
+            signal.Set();
+            SpeakLifecycleAnnouncement(announcement, true);
         }
 
         private void Shutdown(string announcement)
@@ -87,17 +121,35 @@ namespace WeChatMsgHelper
             if (initialized && !stopping) SpeakLifecycleAnnouncement(BuildStartupAnnouncement(), false);
             while (!stopping)
             {
-                string text;
-                if (!queue.TryDequeue(out text))
+                SpeechRequest request;
+                if (!queue.TryDequeue(out request))
                 {
                     signal.WaitOne(1000);
                     continue;
                 }
                 Interlocked.Decrement(ref queuedCount);
+                if (request.StopVersion != Thread.VolatileRead(ref stopVersion)) continue;
                 try
                 {
-                    if (!channel.Speak(text, false)) AppLog.Write("语音通道朗读失败：" + channel.Name);
-                    else AppLog.Write("语音请求已提交，通道=" + channel.Name + "，长度=" + text.Length);
+                    IList<string> chunks = SplitText(request.Text);
+                    bool submitted = true;
+                    for (int index = 0; index < chunks.Count; index++)
+                    {
+                        if (stopping || request.StopVersion != Thread.VolatileRead(ref stopVersion))
+                        {
+                            submitted = false;
+                            break;
+                        }
+                        if (!channel.Speak(chunks[index], false))
+                        {
+                            AppLog.Write("语音通道朗读失败：" + channel.Name + "，分段=" + (index + 1) + "/" + chunks.Count);
+                            submitted = false;
+                            break;
+                        }
+                        if (index + 1 < chunks.Count) Thread.Sleep(50);
+                    }
+                    if (submitted)
+                        AppLog.Write("语音请求已提交，通道=" + channel.Name + "，长度=" + request.Text.Length + "，分段=" + chunks.Count);
                 }
                 catch (Exception ex)
                 {
@@ -105,6 +157,41 @@ namespace WeChatMsgHelper
                 }
                 Thread.Sleep(50);
             }
+        }
+
+        private static IList<string> SplitText(string text)
+        {
+            List<string> chunks = new List<string>();
+            int offset = 0;
+            while (text.Length - offset > MaxSpeechChunkLength)
+            {
+                int length = FindSplitLength(text, offset);
+                if (offset + length < text.Length && length > 0 &&
+                    char.IsHighSurrogate(text[offset + length - 1]) && char.IsLowSurrogate(text[offset + length]))
+                    length--;
+                AddChunk(chunks, text.Substring(offset, length));
+                offset += length;
+            }
+            AddChunk(chunks, text.Substring(offset));
+            return chunks;
+        }
+
+        private static int FindSplitLength(string text, int offset)
+        {
+            int maximum = Math.Min(MaxSpeechChunkLength, text.Length - offset);
+            for (int index = maximum - 1; index >= PreferredSplitStart; index--)
+            {
+                char value = text[offset + index];
+                if (char.IsWhiteSpace(value) || value == '。' || value == '！' || value == '？' ||
+                    value == '；' || value == '，' || value == '.' || value == '!' ||
+                    value == '?' || value == ';' || value == ',') return index + 1;
+            }
+            return maximum;
+        }
+
+        private static void AddChunk(ICollection<string> chunks, string text)
+        {
+            if (!string.IsNullOrWhiteSpace(text)) chunks.Add(text);
         }
 
         private void SpeakLifecycleAnnouncement(string text, bool interrupt)
@@ -129,11 +216,7 @@ namespace WeChatMsgHelper
 
         private static string BuildStartupAnnouncement()
         {
-            Version version = Assembly.GetExecutingAssembly().GetName().Version;
-            string value = version == null
-                ? "未知版本"
-                : version.Major + "." + version.Minor + "." + Math.Max(0, version.Build) + "." + Math.Max(0, version.Revision);
-            return "微信消息助手 " + value;
+            return "微信消息助手 " + UpdateReleaseNotes.CurrentVersion;
         }
     }
 }

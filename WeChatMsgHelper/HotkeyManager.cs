@@ -60,13 +60,15 @@ namespace WeChatMsgHelper
 
         internal bool HasFallbackHotkeys { get { return fallback.Count > 0; } }
 
-        internal void RegisterAll(AppConfig config, Action<string> onFailure)
+        internal IList<string> RegisterAll(AppConfig config, Action<string> onFailure)
         {
             UnregisterAll();
-            Register(ReadLatestId, config.ReadLatestHotkey, onFailure);
-            Register(ToggleNotifyId, config.ToggleNotifyHotkey, onFailure);
-            Register(ToggleModeId, config.ToggleModeHotkey, onFailure);
-            Register(OpenSettingsId, config.OpenSettingsHotkey, onFailure);
+            List<string> failures = new List<string>();
+            RegisterConfigured(ReadLatestId, "朗读最新消息", config.ReadLatestHotkey, failures, onFailure);
+            RegisterConfigured(ToggleNotifyId, "启动或停止监听", config.ToggleNotifyHotkey, failures, onFailure);
+            RegisterConfigured(ToggleModeId, "切换通知方式", config.ToggleModeHotkey, failures, onFailure);
+            RegisterConfigured(OpenSettingsId, "打开设置", config.OpenSettingsHotkey, failures, onFailure);
+            return failures;
         }
 
         internal void UpdateWeChatContext(bool foreground, bool inputFocused, Action<string> onFailure)
@@ -128,15 +130,20 @@ namespace WeChatMsgHelper
             return activated;
         }
 
-        private void Register(int id, string text, Action<string> onFailure)
+        private void RegisterConfigured(int id, string name, string text, ICollection<string> failures, Action<string> onFailure)
         {
-            if (registered.Contains(id) || fallback.ContainsKey(id)) return;
+            if (!Register(id, text, onFailure)) failures.Add(name + "：" + text);
+        }
+
+        private bool Register(int id, string text, Action<string> onFailure)
+        {
+            if (registered.Contains(id) || fallback.ContainsKey(id)) return true;
             uint modifiers;
             Keys key;
             if (!TryParse(text, out modifiers, out key))
             {
                 if (onFailure != null) onFailure("快捷键注册失败：" + text);
-                return;
+                return false;
             }
             if (!RegisterHotKey(handle, id, modifiers | ModNoRepeat, (uint)key))
             {
@@ -144,11 +151,13 @@ namespace WeChatMsgHelper
                 {
                     fallback[id] = new FallbackHotkey { Modifiers = modifiers, Key = key };
                     if (onFailure != null) onFailure("快捷键系统注册冲突，已启用兼容检测：" + text);
+                    return true;
                 }
                 else if (onFailure != null) onFailure("快捷键注册失败：" + text);
-                return;
+                return false;
             }
             registered.Add(id);
+            return true;
         }
 
         private void Unregister(int id)
@@ -158,7 +167,7 @@ namespace WeChatMsgHelper
             fallbackPressed.Remove(id);
         }
 
-        private void UnregisterAll()
+        internal void UnregisterAll()
         {
             foreach (int id in registered) UnregisterHotKey(handle, id);
             registered.Clear();

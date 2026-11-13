@@ -55,6 +55,7 @@ namespace WeChatMsgHelper.Channels
         public bool Speak(string text, bool interrupt)
         {
             if (string.IsNullOrWhiteSpace(text)) return true;
+            ISpeechChannel current;
             lock (syncRoot)
             {
                 if (disposed) return false;
@@ -64,16 +65,32 @@ namespace WeChatMsgHelper.Channels
                     AppLog.Write("自动通道初始化失败：" + error);
                     return false;
                 }
-                if (active.Speak(text, interrupt)) return true;
-
-                string failedName = active.Name;
-                if (active is Sapi5Channel) return false;
-                AppLog.Write("自动通道：" + failedName + " 朗读失败，切换到 SAPI5。 ");
-                DisposeActive();
-                List<string> errors = new List<string>();
-                if (!TryActivate(new Sapi5Channel(config), errors)) return false;
-                return active.Speak(text, interrupt);
+                current = active;
             }
+
+            if (current.Speak(text, interrupt)) return true;
+            if (current is Sapi5Channel) return false;
+
+            lock (syncRoot)
+            {
+                if (disposed) return false;
+                if (!object.ReferenceEquals(active, current))
+                {
+                    current = active;
+                }
+                else
+                {
+                    string failedName = current.Name;
+                    AppLog.Write("自动通道：" + failedName + " 朗读失败，切换到 SAPI5。 ");
+                    DisposeActive();
+                    List<string> errors = new List<string>();
+                    if (!TryActivate(new Sapi5Channel(config), errors)) return false;
+                    current = active;
+                }
+            }
+
+            if (current == null) return false;
+            return current.Speak(text, interrupt);
         }
 
         public bool Submit(string text, bool interrupt)

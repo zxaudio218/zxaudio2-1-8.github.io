@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows.Automation;
 
 namespace WeChatMsgHelper
@@ -54,6 +55,9 @@ namespace WeChatMsgHelper
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetAncestor(IntPtr windowHandle, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string moduleName);
@@ -134,6 +138,12 @@ namespace WeChatMsgHelper
 
         private void OnFocusChanged(object sender, AutomationFocusChangedEventArgs args)
         {
+            if (!IsWechatToolPopupForeground())
+            {
+                ClearFocusedEmoji();
+                return;
+            }
+
             AutomationElement element = sender as AutomationElement;
             if (element == null) return;
             try
@@ -168,6 +178,8 @@ namespace WeChatMsgHelper
 
         private void OnInvoked(object sender, AutomationEventArgs args)
         {
+            if (!IsWechatToolPopupForeground()) return;
+
             AutomationElement element = sender as AutomationElement;
             if (element == null || emojiInvoked == null) return;
             try
@@ -199,8 +211,8 @@ namespace WeChatMsgHelper
                 if (code == HcAction && (messageId == WmKeyUp || messageId == WmSysKeyUp))
                 {
                     int virtualKey = Marshal.ReadInt32(data);
-                    if (virtualKey == VkReturn || virtualKey == VkSpace)
-                        HandleKeyboardEmojiActivation();
+                    if ((virtualKey == VkReturn || virtualKey == VkSpace) && IsWechatToolPopupForeground())
+                        QueueInputWork(HandleKeyboardEmojiActivation);
                 }
             }
             catch { }
@@ -214,11 +226,27 @@ namespace WeChatMsgHelper
                 if (code == HcAction && message.ToInt32() == WmLButtonUp)
                 {
                     MouseHookData mouseData = (MouseHookData)Marshal.PtrToStructure(data, typeof(MouseHookData));
-                    HandleMouseEmojiActivation(mouseData.Point);
+                    NativePoint point = mouseData.Point;
+                    if (IsWechatToolPopupAtPoint(point))
+                        QueueInputWork(delegate { HandleMouseEmojiActivation(point); });
                 }
             }
             catch { }
             return CallNextHookEx(mouseHook, code, message, data);
+        }
+
+        private void QueueInputWork(Action action)
+        {
+            if (action == null) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    // Marshal from a worker so the low-level hook returns before UI Automation starts.
+                    dispatch(action);
+                }
+                catch { }
+            });
         }
 
         private void HandleKeyboardEmojiActivation()
@@ -334,6 +362,13 @@ namespace WeChatMsgHelper
             StringBuilder className = new StringBuilder(256);
             GetClassName(windowHandle, className, className.Capacity);
             return className.ToString() == "Qt51514QWindowToolSaveBits";
+        }
+
+        private static bool IsWechatToolPopupForeground()
+        {
+            IntPtr windowHandle = GetForegroundWindow();
+            if (IsWechatToolPopupWindow(windowHandle)) return true;
+            return IsWechatToolPopupWindow(GetAncestor(windowHandle, GaRoot));
         }
 
         private static bool IsWechatToolPopupAtPoint(NativePoint point)

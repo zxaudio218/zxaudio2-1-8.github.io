@@ -38,6 +38,11 @@ namespace WeChatMsgHelper
 
     internal sealed class AppConfig
     {
+        internal const string DefaultReadLatestHotkey = "Ctrl+Alt+F11";
+        internal const string DefaultToggleNotifyHotkey = "Ctrl+Alt+Shift+F11";
+        internal const string DefaultToggleModeHotkey = "Ctrl+Alt+P";
+        internal const string DefaultOpenSettingsHotkey = "Ctrl+Alt+S";
+
         public string FilePath;
         public NotificationMode NotificationMode = NotificationMode.SpeechAndSound;
         public bool ListeningEnabled = true;
@@ -48,10 +53,11 @@ namespace WeChatMsgHelper
         public bool IgnoreSystemMessages;
         public bool AutoStart;
         public string SpeechChannel = SpeechChannelNames.ZhengduIndependent;
-        public string ReadLatestHotkey = "Ctrl+Alt+F11";
-        public string ToggleNotifyHotkey = "Ctrl+Alt+Shift+F11";
-        public string ToggleModeHotkey = "Ctrl+Alt+P";
-        public string OpenSettingsHotkey = "Ctrl+Alt+S";
+        public string ReadLatestHotkey = DefaultReadLatestHotkey;
+        public string ToggleNotifyHotkey = DefaultToggleNotifyHotkey;
+        public string ToggleModeHotkey = DefaultToggleModeHotkey;
+        public string OpenSettingsHotkey = DefaultOpenSettingsHotkey;
+        public string SuppressedHotkeyConflictSignature = string.Empty;
         public bool ZhengduKeyDownInterrupt;
         public string BaoyiChannelName = "WeChatMsg";
         public string Sapi5Voice = string.Empty;
@@ -84,6 +90,7 @@ namespace WeChatMsgHelper
             config.ToggleNotifyHotkey = Get(values, "Hotkeys.ToggleNotify", config.ToggleNotifyHotkey);
             config.ToggleModeHotkey = Get(values, "Hotkeys.ToggleMode", config.ToggleModeHotkey);
             config.OpenSettingsHotkey = Get(values, "Hotkeys.OpenSettings", config.OpenSettingsHotkey);
+            config.SuppressedHotkeyConflictSignature = Get(values, "Hotkeys.SuppressedConflictSignature", config.SuppressedHotkeyConflictSignature);
             config.ZhengduKeyDownInterrupt = GetBool(values, "Zhengdu.KeyDownInterrupt", config.ZhengduKeyDownInterrupt);
             config.BaoyiChannelName = NormalizeBaoyiChannelName(Get(values, "Baoyi.ChannelName", config.BaoyiChannelName));
             config.Sapi5Voice = Get(values, "Sapi5.Voice", config.Sapi5Voice);
@@ -115,6 +122,7 @@ namespace WeChatMsgHelper
                 "ToggleNotify=" + ToggleNotifyHotkey,
                 "ToggleMode=" + ToggleModeHotkey,
                 "OpenSettings=" + OpenSettingsHotkey,
+                "SuppressedConflictSignature=" + (SuppressedHotkeyConflictSignature ?? string.Empty),
                 string.Empty,
                 "[Zhengdu]",
                 "KeyDownInterrupt=" + Bool(ZhengduKeyDownInterrupt),
