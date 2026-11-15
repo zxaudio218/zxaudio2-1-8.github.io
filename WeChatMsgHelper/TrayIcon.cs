@@ -17,7 +17,7 @@ namespace WeChatMsgHelper
 
         internal TrayIcon(Action toggleListening, Action<NotificationMode> setMode, Action<string> setSpeechChannel,
             Action readLatest, Action testSpeech, Action openSettings, Action checkUpdates, Action showReleaseNotes,
-            Action exportLog, Action exit)
+            Action showAssistantHelp, Action exportLog, Action exit)
         {
             menu = new ContextMenu();
             statusItem = new MenuItem("正在启动...") { Enabled = false };
@@ -43,6 +43,7 @@ namespace WeChatMsgHelper
             menu.MenuItems.Add(new MenuItem("朗读最新消息", delegate { readLatest(); }));
             menu.MenuItems.Add(new MenuItem("测试语音通道", delegate { testSpeech(); }));
             menu.MenuItems.Add(new MenuItem("设置...", delegate { openSettings(); }));
+            menu.MenuItems.Add(new MenuItem("查看助手说明", delegate { showAssistantHelp(); }));
             menu.MenuItems.Add(new MenuItem("-"));
             menu.MenuItems.Add(new MenuItem("检查更新", delegate { checkUpdates(); }));
             menu.MenuItems.Add(new MenuItem("更新日志", delegate { showReleaseNotes(); }));

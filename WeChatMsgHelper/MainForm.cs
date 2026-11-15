@@ -14,9 +14,10 @@ namespace WeChatMsgHelper
     internal sealed class MainForm : Form
     {
         private const int WmHotkey = 0x0312;
-        private const int DiscoveryFastIntervalMs = 500;
+        private const int DiscoveryWarmupIntervalMs = 1000;
         private const int DiscoveryStableIntervalMs = 2000;
         private const int DiscoveryIdleIntervalMs = 2000;
+        private const int WechatStartupCooldownMs = 4000;
         private const int ContextProbeIntervalMs = 500;
         private const int VoipProbeIntervalMs = 1000;
         private const int SwShow = 5;
@@ -50,7 +51,11 @@ namespace WeChatMsgHelper
         private bool exiting;
         private bool settingsOpen;
         private bool wechatWasForeground;
-        private int discoveryPending;
+        private int discoveryRunningGeneration = -1;
+        private int wechatGeneration;
+        private int discoveryStartedGeneration = -1;
+        private string wechatProcessSignature;
+        private DateTime wechatDiscoveryNotBeforeUtc = DateTime.MinValue;
         private int voipProbePending;
         private int exitStarted;
         private bool updateCheckPending;
@@ -72,9 +77,8 @@ namespace WeChatMsgHelper
             AppLog.Initialize(AppDataPaths.DataDirectory);
             foreach (string warning in migrationWarnings) AppLog.Write(warning);
             config = LoadConfig();
-            MigrateLegacyHotkeys();
             tray = new TrayIcon(ToggleListening, SetMode, SetSpeechChannel, ReadLatest, TestSpeech, RequestOpenSettings,
-                delegate { CheckForUpdates(true); }, ShowCurrentReleaseNotes, ExportLog, ExitApplication);
+                delegate { CheckForUpdates(true); }, ShowCurrentReleaseNotes, ShowAssistantHelp, ExportLog, ExitApplication);
             hotkeys = new HotkeyManager(Handle);
             IList<string> startupHotkeyFailures = hotkeys.RegisterAll(config, ReportHotkeyFailure);
             CreateListener();
@@ -83,7 +87,7 @@ namespace WeChatMsgHelper
                 delegate(string name) { if (listener != null) listener.NoteEmojiSent(name); });
             ApplySavedStartup();
 
-            discoveryTimer.Interval = DiscoveryFastIntervalMs;
+            discoveryTimer.Interval = DiscoveryWarmupIntervalMs;
             discoveryTimer.Tick += delegate { BeginBindWechat(); };
             discoveryTimer.Start();
             contextTimer.Interval = ContextProbeIntervalMs;
@@ -185,6 +189,11 @@ namespace WeChatMsgHelper
         {
             if (listener != null) listener.Dispose();
             if (reviewManager != null) reviewManager.Dispose();
+            CreateFreshListener();
+        }
+
+        private void CreateFreshListener()
+        {
             extractor = new MessageExtractor(config.ReadNonTextMessages);
             listener = new MessageListener(extractor, config, ProcessIncomingMessage, ProcessConversationOpened, Dispatch, BeginBindWechat);
             reviewManager = new MessageReviewManager(navigator, extractor, SpeakText, SuppressAutomaticNotifications);
@@ -192,7 +201,20 @@ namespace WeChatMsgHelper
 
         private void BeginBindWechat()
         {
-            if (exiting || settingsOpen || Interlocked.Exchange(ref discoveryPending, 1) != 0) return;
+            if (exiting || settingsOpen) return;
+            string processSignature = GetWechatProcessSignature();
+            if (processSignature == null) return;
+            RefreshWechatProcessGeneration(processSignature);
+            if (processSignature.Length == 0) return;
+            if (DateTime.UtcNow < wechatDiscoveryNotBeforeUtc) return;
+
+            int generation = wechatGeneration;
+            if (Interlocked.CompareExchange(ref discoveryRunningGeneration, generation, -1) != -1) return;
+            if (discoveryStartedGeneration != generation)
+            {
+                discoveryStartedGeneration = generation;
+                AppLog.Write("微信界面启动冷却结束，开始发现会话，进程=" + processSignature);
+            }
             if (!ThreadPool.QueueUserWorkItem(delegate
             {
                 IList<DiscoveredWechatRoot> roots = null;
@@ -203,8 +225,14 @@ namespace WeChatMsgHelper
                 stopwatch.Stop();
                 Dispatch(delegate
                 {
-                    Interlocked.Exchange(ref discoveryPending, 0);
+                    Interlocked.CompareExchange(ref discoveryRunningGeneration, -1, generation);
                     if (exiting || settingsOpen) return;
+                    if (generation != wechatGeneration ||
+                        !string.Equals(processSignature, wechatProcessSignature, StringComparison.Ordinal))
+                    {
+                        AppLog.Write("已丢弃旧微信进程的 UIA 发现结果，代次=" + generation + "，进程=" + processSignature);
+                        return;
+                    }
                     if (stopwatch.ElapsedMilliseconds >= 1000)
                         AppLog.Write("微信 UIA 发现耗时=" + stopwatch.ElapsedMilliseconds + "ms，窗口=" + (roots == null ? 0 : roots.Count));
                     if (error != null)
@@ -216,16 +244,103 @@ namespace WeChatMsgHelper
                     }
                     ApplyWechatRoots(roots ?? new List<DiscoveredWechatRoot>());
                 });
-            })) Interlocked.Exchange(ref discoveryPending, 0);
+            })) Interlocked.CompareExchange(ref discoveryRunningGeneration, -1, generation);
+        }
+
+        private void RefreshWechatProcessGeneration(string processSignature)
+        {
+            if (wechatProcessSignature == null)
+            {
+                wechatProcessSignature = processSignature;
+                wechatGeneration = 1;
+                if (processSignature.Length == 0)
+                {
+                    statusText = "等待微信启动";
+                    discoveryTimer.Interval = DiscoveryIdleIntervalMs;
+                }
+                else
+                {
+                    wechatDiscoveryNotBeforeUtc = DateTime.UtcNow.AddMilliseconds(WechatStartupCooldownMs);
+                    statusText = "等待微信界面加载";
+                    discoveryTimer.Interval = DiscoveryWarmupIntervalMs;
+                    AppLog.Write("检测到微信进程，等待界面稳定，进程=" + processSignature);
+                }
+                UpdateTray();
+                return;
+            }
+            if (string.Equals(wechatProcessSignature, processSignature, StringComparison.Ordinal)) return;
+
+            string previousSignature = wechatProcessSignature;
+            wechatProcessSignature = processSignature;
+            wechatGeneration++;
+            discoveryStartedGeneration = -1;
+            Interlocked.Exchange(ref discoveryRunningGeneration, -1);
+            RetireWechatListener();
+
+            if (processSignature.Length == 0)
+            {
+                wechatDiscoveryNotBeforeUtc = DateTime.MaxValue;
+                discoveryTimer.Interval = DiscoveryIdleIntervalMs;
+                statusText = "等待微信重新启动";
+                AppLog.Write("微信进程已退出，旧监听已隔离，原进程=" + previousSignature);
+            }
+            else
+            {
+                wechatDiscoveryNotBeforeUtc = DateTime.UtcNow.AddMilliseconds(WechatStartupCooldownMs);
+                discoveryTimer.Interval = DiscoveryWarmupIntervalMs;
+                statusText = "等待微信界面加载";
+                AppLog.Write("微信进程已变化，旧监听已隔离，原进程=" + previousSignature + "，新进程=" + processSignature);
+            }
+            UpdateTray();
+        }
+
+        private void RetireWechatListener()
+        {
+            if (listener != null) listener.RetireAfterWechatExit();
+            if (reviewManager != null) reviewManager.Dispose();
+            CreateFreshListener();
+        }
+
+        private static string GetWechatProcessSignature()
+        {
+            Process[] processes;
+            try { processes = Process.GetProcessesByName("Weixin"); }
+            catch (Exception ex)
+            {
+                AppLog.Write("读取微信进程失败：" + ex.Message);
+                return null;
+            }
+            int processId = -1;
+            int fallbackProcessId = -1;
+            long startTicks = long.MaxValue;
+            bool hasStartTime = false;
+            foreach (Process process in processes)
+            {
+                try
+                {
+                    int candidateId = process.Id;
+                    if (fallbackProcessId < 0 || candidateId < fallbackProcessId) fallbackProcessId = candidateId;
+                    long candidateTicks = process.StartTime.ToUniversalTime().Ticks;
+                    if (!hasStartTime || candidateTicks < startTicks ||
+                        (candidateTicks == startTicks && candidateId < processId))
+                    {
+                        processId = candidateId;
+                        startTicks = candidateTicks;
+                        hasStartTime = true;
+                    }
+                }
+                catch { }
+                finally { process.Dispose(); }
+            }
+            if (processId < 0) return fallbackProcessId < 0 ? string.Empty : fallbackProcessId.ToString();
+            return processId + ":" + startTicks;
         }
 
         private void ApplyWechatRoots(IList<DiscoveredWechatRoot> roots)
         {
             if (roots.Count == 0)
             {
-                discoveryTimer.Interval = navigator.IsWechatForeground()
-                    ? DiscoveryFastIntervalMs
-                    : DiscoveryIdleIntervalMs;
+                discoveryTimer.Interval = DiscoveryIdleIntervalMs;
                 try { listener.Synchronize(roots, true); }
                 catch (Exception ex) { AppLog.Write("清理微信 UIA 绑定失败：" + ex.Message); }
                 statusText = "等待打开具体微信聊天";
@@ -337,7 +452,10 @@ namespace WeChatMsgHelper
                 bool foreground = navigator.IsWechatForeground();
                 if (foreground && !wechatWasForeground) BeginBindWechat();
                 wechatWasForeground = foreground;
-                hotkeys.UpdateWeChatContext(foreground, navigator.IsMessageInputFocused(foreground), ReportHotkeyFailure);
+                bool inputFocused = listener != null && listener.IsBound &&
+                    DateTime.UtcNow >= wechatDiscoveryNotBeforeUtc &&
+                    navigator.IsMessageInputFocused(foreground);
+                hotkeys.UpdateWeChatContext(foreground, inputFocused, ReportHotkeyFailure);
                 UpdateHotkeyFallbackTimer();
             }
             catch (Exception ex) { AppLog.Write("微信快捷键上下文探测失败：" + ex.Message); }
@@ -466,13 +584,13 @@ namespace WeChatMsgHelper
                 hotkeyFailures = hotkeys.RegisterAll(config, ReportHotkeyFailure);
                 activeSettingsForm = null;
                 settingsOpen = false;
+                if (!exiting) BeginBindWechat();
                 if (listener != null) listener.Resume();
                 if (!exiting)
                 {
                     discoveryTimer.Start();
                     contextTimer.Start();
                     voipTimer.Start();
-                    BeginBindWechat();
                     BeginUpdateVoipContext();
                     UpdateHotkeyFallbackTimer();
                 }
@@ -567,31 +685,6 @@ namespace WeChatMsgHelper
             if (!config.AutoStart) return;
             string error;
             if (!StartupManager.SetEnabled(true, out error)) AppLog.Write("恢复开机启动失败：" + error);
-        }
-
-        private void MigrateLegacyHotkeys()
-        {
-            bool changed = false;
-            if (config.ReadLatestHotkey.Equals("Ctrl+Alt+M", StringComparison.OrdinalIgnoreCase) ||
-                config.ReadLatestHotkey.Equals("Ctrl+Shift+Alt+M", StringComparison.OrdinalIgnoreCase) ||
-                config.ReadLatestHotkey.Equals("Ctrl+F11", StringComparison.OrdinalIgnoreCase))
-            {
-                config.ReadLatestHotkey = AppConfig.DefaultReadLatestHotkey;
-                changed = true;
-            }
-            if (config.ToggleNotifyHotkey.Equals("Ctrl+Alt+N", StringComparison.OrdinalIgnoreCase) ||
-                config.ToggleNotifyHotkey.Equals("Ctrl+Shift+Alt+N", StringComparison.OrdinalIgnoreCase) ||
-                config.ToggleNotifyHotkey.Equals("Ctrl+Shift+F11", StringComparison.OrdinalIgnoreCase) ||
-                config.ToggleNotifyHotkey.Equals("Alt+Shift+F8", StringComparison.OrdinalIgnoreCase))
-            {
-                config.ToggleNotifyHotkey = AppConfig.DefaultToggleNotifyHotkey;
-                changed = true;
-            }
-            if (changed)
-            {
-                try { config.Save(); }
-                catch (Exception ex) { AppLog.Write("迁移冲突热键失败：" + ex.Message); }
-            }
         }
 
         private void SaveConfig()
@@ -703,6 +796,11 @@ namespace WeChatMsgHelper
         {
             using (ReleaseNotesForm form = new ReleaseNotesForm("微信消息助手 " + UpdateReleaseNotes.CurrentVersion + " 更新日志", UpdateReleaseNotes.Current, false))
                 form.ShowDialog();
+        }
+
+        private void ShowAssistantHelp()
+        {
+            using (AssistantHelpForm form = new AssistantHelpForm()) form.ShowDialog();
         }
 
         private void ShowInstalledReleaseNotes()

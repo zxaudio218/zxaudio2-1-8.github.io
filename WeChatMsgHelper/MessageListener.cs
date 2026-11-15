@@ -191,6 +191,24 @@ namespace WeChatMsgHelper
             extractDelayTimer.Dispose();
         }
 
+        internal void RetireAfterWechatExit()
+        {
+            if (disposed) return;
+            suspended = true;
+            disposed = true;
+            pollTimer.Stop();
+            CancelScheduledExtract();
+            // Do not unsubscribe dead UIA providers here; that call can block while WeChat is restarting.
+            lock (bindingLock)
+            {
+                foreach (Binding binding in bindings.Values) binding.Removed = true;
+                bindings.Clear();
+            }
+            Interlocked.Exchange(ref extractAgain, 0);
+            pollTimer.Dispose();
+            extractDelayTimer.Dispose();
+        }
+
         private void AddBinding(DiscoveredWechatRoot discovered, bool announce)
         {
             if (discovered == null || discovered.MessageList == null) return;
